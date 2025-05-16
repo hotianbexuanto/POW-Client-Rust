@@ -260,4 +260,41 @@ impl App {
     pub fn set_config(&mut self, config: AppConfig) {
         self.config = config;
     }
+
+    // 清理旧任务
+    pub fn clean_old_tasks(&mut self, max_tasks: usize) {
+        // 首先保留最新的计算任务和当前正在提交的任务
+        let mut active_tasks: Vec<TaskInfo> = self
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.status == "计算中"
+                    || t.status == "处理中"
+                    || t.status == "请求中"
+                    || t.status.contains("后台提交")
+                    || t.status == "提交中"
+            })
+            .cloned()
+            .collect();
+
+        // 找出最近完成的任务(成功或失败)
+        let mut completed_tasks: Vec<TaskInfo> = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == "成功" || t.status == "提交失败" || t.status == "错误")
+            .cloned()
+            .collect();
+
+        // 按ID排序，保留最新的
+        completed_tasks.sort_by(|a, b| b.id.cmp(&a.id));
+
+        // 只保留指定数量的已完成任务
+        completed_tasks.truncate(max_tasks);
+
+        // 合并活跃任务和最近完成的任务
+        active_tasks.extend(completed_tasks);
+
+        // 更新任务列表
+        self.tasks = active_tasks;
+    }
 }

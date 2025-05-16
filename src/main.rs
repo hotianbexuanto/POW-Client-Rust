@@ -479,12 +479,18 @@ async fn start_mining_loop<M: Middleware + 'static>(
                     }
                 }
                 Err(e) => {
-                    // 提交失败
+                    // 提交失败 - 更新任务状态为提交失败
                     let error_msg = format!("任务 {} 后台提交失败: {}", submit_task_id, e);
                     submit_app_state
                         .lock()
                         .unwrap()
                         .add_log(error_msg, LogLevel::Error);
+
+                    // 更新任务状态为提交失败，这样UI就不会继续显示它
+                    submit_app_state
+                        .lock()
+                        .unwrap()
+                        .update_task(submit_task_id, "提交失败".to_string());
                 }
             }
         }
@@ -520,6 +526,11 @@ async fn start_mining_loop<M: Middleware + 'static>(
 
         // 增加任务ID以准备下一个任务
         task_id += 1;
+
+        // 每10个任务清理一次，保留最近的5个已完成任务
+        if task_id % 10 == 0 {
+            app_state.lock().unwrap().clean_old_tasks(5);
+        }
 
         // 不添加延迟，立即开始下一个任务
     }

@@ -260,7 +260,9 @@ fn render_task_list<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
     let submitting_tasks: Vec<&TaskInfo> = app
         .tasks
         .iter()
-        .filter(|t| t.status.contains("后台提交") || t.status == "提交中")
+        .filter(|t| {
+            (t.status.contains("后台提交") || t.status == "提交中") && t.status != "提交失败"
+        })
         .collect();
 
     // 任务行 - 显示最新的计算任务和正在提交的任务
@@ -288,7 +290,7 @@ fn render_task_list<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
             let status_style = match status.as_str() {
                 "成功" => Style::default().fg(Color::Green),
                 "处理中" | "计算中" => Style::default().fg(Color::Yellow),
-                "错误" => Style::default().fg(Color::Red),
+                "错误" | "提交失败" => Style::default().fg(Color::Red),
                 _ => Style::default().fg(Color::White),
             };
 
