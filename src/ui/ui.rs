@@ -1,4 +1,4 @@
-use crate::ui::app::{App, LogLevel};
+use crate::ui::app::{App, LogLevel, TaskInfo};
 use ratatui::{
     backend::Backend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -144,11 +144,11 @@ fn render_config_info<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
     // 配置信息
     let config_info = vec![
         Line::from(vec![
-            Span::styled("任务数量: ", Style::default().fg(Color::Yellow)),
-            Span::raw(format!("{}", app.config.task_count)),
+            Span::styled("挖矿模式: ", Style::default().fg(Color::Yellow)),
+            Span::raw("单任务多线程"),
         ]),
         Line::from(vec![
-            Span::styled("每任务线程数: ", Style::default().fg(Color::Yellow)),
+            Span::styled("并行线程数: ", Style::default().fg(Color::Yellow)),
             Span::raw(format!("{}", app.config.thread_count)),
         ]),
         Line::from(vec![
@@ -189,14 +189,26 @@ fn render_mining_summary<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
     // 格式化运行时间
     let uptime_str = format_duration(Duration::from_secs(app.mining_status.uptime));
 
+    // 计算后台提交任务数量
+    let submitting_count = app
+        .tasks
+        .iter()
+        .filter(|t| t.status.contains("后台提交") || t.status == "提交中")
+        .count();
+
     // 挖矿摘要信息
     let mining_summary = vec![
         Line::from(vec![
-            Span::styled("活跃任务: ", Style::default().fg(Color::Yellow)),
-            Span::raw(format!(
-                "{}/{}",
-                app.mining_status.active_tasks, app.mining_status.total_tasks
-            )),
+            Span::styled("挖矿状态: ", Style::default().fg(Color::Yellow)),
+            Span::styled("活跃", Style::default().fg(Color::Green)),
+        ]),
+        Line::from(vec![
+            Span::styled("工作模式: ", Style::default().fg(Color::Yellow)),
+            Span::styled("不等待提交", Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::styled("线程数: ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{}", app.config.thread_count)),
         ]),
         Line::from(vec![
             Span::styled("总哈希率: ", Style::default().fg(Color::Yellow)),
@@ -205,6 +217,10 @@ fn render_mining_summary<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("找到解决方案: ", Style::default().fg(Color::Yellow)),
             Span::raw(format!("{}", app.mining_status.total_solutions_found)),
+        ]),
+        Line::from(vec![
+            Span::styled("后台提交中: ", Style::default().fg(Color::Blue)),
+            Span::raw(format!("{}", submitting_count)),
         ]),
         Line::from(vec![
             Span::styled("挖矿获得: ", Style::default().fg(Color::Green)),
@@ -237,8 +253,59 @@ fn render_task_list<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
     });
     let header = Row::new(header_cells).style(Style::default().fg(Color::Yellow));
 
-    // 任务行
-    let rows = app.tasks.iter().map(|task| {
+    // 找出最新的计算任务和正在后台提交的任务
+    let latest_task = app.tasks.iter().max_by_key(|t| t.id);
+
+    // 找出正在后台提交的任务
+    let submitting_tasks: Vec<&TaskInfo> = app
+        .tasks
+        .iter()
+        .filter(|t| t.status.contains("后台提交") || t.status == "提交中")
+        .collect();
+
+    // 任务行 - 显示最新的计算任务和正在提交的任务
+    let mut rows = Vec::new();
+
+    // 添加最新的计算任务
+    if let Some(task) = latest_task {
+        // 只有当最新任务不是提交状态时才显示，避免重复
+        if !task.status.contains("后台提交") && task.status != "提交中" {
+            let id = task.id.to_string();
+            let nonce = match task.nonce {
+                Some(n) => format!("{:?}", n),
+                None => "-".to_string(),
+            };
+            let difficulty = match task.difficulty {
+                Some(d) => format!("{:?}", d),
+                None => "-".to_string(),
+            };
+            let status = task.status.clone();
+            let hash_rate = match task.hash_rate {
+                Some(rate) => format!("{:.2} H/s", rate),
+                None => "-".to_string(),
+            };
+
+            let status_style = match status.as_str() {
+                "成功" => Style::default().fg(Color::Green),
+                "处理中" | "计算中" => Style::default().fg(Color::Yellow),
+                "错误" => Style::default().fg(Color::Red),
+                _ => Style::default().fg(Color::White),
+            };
+
+            let cells = vec![
+                Span::raw(id),
+                Span::raw(nonce),
+                Span::raw(difficulty),
+                Span::styled(status, status_style),
+                Span::raw(hash_rate),
+            ];
+
+            rows.push(Row::new(cells));
+        }
+    }
+
+    // 添加所有后台提交中的任务
+    for task in submitting_tasks {
         let id = task.id.to_string();
         let nonce = match task.nonce {
             Some(n) => format!("{:?}", n),
@@ -254,12 +321,7 @@ fn render_task_list<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
             None => "-".to_string(),
         };
 
-        let status_style = match status.as_str() {
-            "成功" => Style::default().fg(Color::Green),
-            "处理中" => Style::default().fg(Color::Yellow),
-            "错误" => Style::default().fg(Color::Red),
-            _ => Style::default().fg(Color::White),
-        };
+        let status_style = Style::default().fg(Color::Blue); // 后台提交用蓝色显示
 
         let cells = vec![
             Span::raw(id),
@@ -269,8 +331,8 @@ fn render_task_list<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(hash_rate),
         ];
 
-        Row::new(cells)
-    });
+        rows.push(Row::new(cells));
+    }
 
     // 渲染任务表格
     let widths = vec![
@@ -282,7 +344,7 @@ fn render_task_list<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
     ];
     let task_table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title("挖矿任务"));
+        .block(Block::default().borders(Borders::ALL).title("当前挖矿任务"));
     f.render_widget(task_table, area);
 }
 
