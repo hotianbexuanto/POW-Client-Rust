@@ -1,0 +1,66 @@
+pub mod app;
+pub mod event;
+pub mod ui;
+
+pub use app::{App, AppState, LogLevel};
+pub use event::{Event, EventHandler};
+pub use ui::render;
+
+use anyhow::Result;
+use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::{
+    io::{self, Stdout},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::sync::mpsc;
+
+// TUI初始化函数
+pub fn init_tui() -> Result<(
+    Terminal<CrosstermBackend<Stdout>>,
+    mpsc::Sender<Event<()>>,
+    mpsc::Receiver<Event<()>>,
+)> {
+    // 设置终端
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let terminal = Terminal::new(backend)?;
+
+    // 设置事件处理
+    let (tx, rx) = mpsc::channel(100);
+    let event_handler = EventHandler::new(tick_rate);
+    let tx_clone = tx.clone();
+    tokio::spawn(async move {
+        event_handler.start(tx_clone).await;
+    });
+
+    Ok((terminal, tx, rx))
+}
+
+// TUI销毁函数
+pub fn destroy_tui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    // 恢复终端
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+// 创建共享的应用状态
+pub fn create_app() -> Arc<Mutex<App>> {
+    Arc::new(Mutex::new(App::new()))
+}
+
+// 定义tick_rate常量
+const tick_rate: Duration = Duration::from_millis(200);
