@@ -357,6 +357,36 @@ async fn check_contract_balance<M: Middleware + 'static>(
     Ok(contract_balance)
 }
 
+// 更新钱包余额函数
+async fn update_wallet_balance<M: Middleware + 'static>(
+    contract: &MiningContract<SignerMiddleware<M, LocalWallet>>,
+    app_state: &Arc<Mutex<App>>,
+) -> Result<()> {
+    // 获取钱包客户端
+    let wallet = contract.client();
+
+    // 获取钱包余额
+    let balance = wallet.get_balance(wallet.address(), None).await?;
+    let balance_eth = ethers::utils::format_ether(balance);
+    let balance_f64 = balance_eth.parse::<f64>().unwrap_or(0.0);
+
+    // 更新应用状态中的钱包信息
+    let wallet_address = wallet.address();
+    app_state
+        .lock()
+        .unwrap()
+        .update_wallet_info(wallet_address, balance_f64);
+
+    // 添加日志
+    let balance_msg = format!("钱包余额已更新: {} MAG", balance_f64);
+    app_state
+        .lock()
+        .unwrap()
+        .add_log(balance_msg, LogLevel::Info);
+
+    Ok(())
+}
+
 async fn start_mining_loop<M: Middleware + 'static>(
     contract: MiningContract<SignerMiddleware<M, LocalWallet>>,
     app_state: Arc<Mutex<App>>,
@@ -369,6 +399,35 @@ async fn start_mining_loop<M: Middleware + 'static>(
 
     let mut task_ids: Vec<usize> = (0..parallel_tasks).collect();
     let mut futures = Vec::new();
+
+    // 启动钱包余额定期更新任务
+    let balance_update_contract = contract.clone();
+    let balance_update_app_state = app_state.clone();
+    tokio::spawn(async move {
+        // 每60秒更新一次钱包余额
+        let update_interval = Duration::from_secs(60);
+        loop {
+            sleep(update_interval).await;
+
+            // 尝试更新钱包余额
+            match update_wallet_balance(&balance_update_contract, &balance_update_app_state).await {
+                Ok(_) => {
+                    let msg = "定期更新钱包余额成功".to_string();
+                    balance_update_app_state
+                        .lock()
+                        .unwrap()
+                        .add_log(msg, LogLevel::Info);
+                }
+                Err(e) => {
+                    let error_msg = format!("定期更新钱包余额失败: {}", e);
+                    balance_update_app_state
+                        .lock()
+                        .unwrap()
+                        .add_log(error_msg, LogLevel::Error);
+                }
+            }
+        }
+    });
 
     loop {
         // 维持指定数量的并行任务
@@ -468,6 +527,16 @@ async fn mine_once<M: Middleware + 'static>(
 
                 // 增加解决方案计数
                 app_state.lock().unwrap().add_solution_found();
+
+                // 更新钱包余额
+                if let Err(e) = update_wallet_balance(contract, app_state).await {
+                    let error_msg = format!("更新钱包余额失败: {}", e);
+                    app_state
+                        .lock()
+                        .unwrap()
+                        .add_log(error_msg, LogLevel::Error);
+                }
+
                 return Ok(());
             }
             Err(e) => {
@@ -477,6 +546,16 @@ async fn mine_once<M: Middleware + 'static>(
                         .lock()
                         .unwrap()
                         .add_log(max_retry_msg, LogLevel::Warning);
+
+                    // 任务失败后也更新钱包余额
+                    if let Err(e) = update_wallet_balance(contract, app_state).await {
+                        let error_msg = format!("更新钱包余额失败: {}", e);
+                        app_state
+                            .lock()
+                            .unwrap()
+                            .add_log(error_msg, LogLevel::Error);
+                    }
+
                     return Err(e);
                 }
 
@@ -579,6 +658,21 @@ async fn mine_task<M: Middleware + 'static>(
         .lock()
         .unwrap()
         .update_task(task_id, "成功".to_string());
+
+    // 更新钱包余额（在提交成功后）
+    if let Err(e) = update_wallet_balance(contract, app_state).await {
+        let error_msg = format!("提交解决方案后更新钱包余额失败: {}", e);
+        app_state
+            .lock()
+            .unwrap()
+            .add_log(error_msg, LogLevel::Error);
+    } else {
+        let success_msg = format!("提交解决方案后钱包余额已更新");
+        app_state
+            .lock()
+            .unwrap()
+            .add_log(success_msg, LogLevel::Success);
+    }
 
     Ok(())
 }
