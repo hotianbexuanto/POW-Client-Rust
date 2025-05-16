@@ -33,6 +33,12 @@ jobs:
             asset_name: pow-client-linux-arm64
             binary_path: target/aarch64-unknown-linux-gnu/release/pow-client
 
+          - os: ubuntu-latest
+            arch: aarch64-android
+            target: aarch64-linux-android
+            asset_name: pow-client-termux-arm64
+            binary_path: target/aarch64-linux-android/release/pow-client
+
     steps:
       - uses: actions/checkout@v4
 
@@ -49,10 +55,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
 
+      - name: Install Android NDK for Termux build
+        if: matrix.arch == 'aarch64-android'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget unzip
+          mkdir -p /tmp/android-ndk
+          cd /tmp/android-ndk
+          wget https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+          unzip android-ndk-r25c-linux.zip
+          echo "ANDROID_NDK_HOME=/tmp/android-ndk/android-ndk-r25c" >> $GITHUB_ENV
+          rustup target add aarch64-linux-android
+
       - name: Build Release
         run: |
           if [ "${{ matrix.arch }}" = "aarch64" ]; then
             env CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc cargo build --release --target ${{ matrix.target }}
+          elif [ "${{ matrix.arch }}" = "aarch64-android" ]; then
+            export PATH=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
+            env CC=aarch64-linux-android21-clang CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=aarch64-linux-android21-clang cargo build --release --target ${{ matrix.target }}
           else
             cargo build --release --target ${{ matrix.target }}
           fi

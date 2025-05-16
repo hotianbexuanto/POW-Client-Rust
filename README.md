@@ -9,7 +9,7 @@ Magnet POW区块链挖矿客户端的Rust实现，性能更优，资源占用更
 - 美观的命令行界面
 - 支持多RPC节点切换
 - 稳定的错误处理和自动重试
-- 支持多平台：Windows、Linux和ARM64 Linux(如手机)
+- 支持多平台：Windows、Linux、ARM64 Linux和Android(Termux)
 
 ## 依赖项
 
@@ -37,6 +37,36 @@ cargo build --release
 ./target/release/pow-client
 ```
 
+### 在Termux(Android)上安装和运行
+
+1. 安装Termux应用并更新
+```bash
+pkg update && pkg upgrade
+```
+
+2. 安装Rust和必要工具
+```bash
+pkg install rust git
+```
+
+3. 克隆项目并构建
+```bash
+git clone https://github.com/hotianbexuanto/POW-Client-Rust.git
+cd POW-Client-Rust
+cargo build --release
+```
+
+4. 运行程序
+```bash
+./target/release/pow-client
+```
+
+也可以直接下载预编译的Termux版本，并授予执行权限：
+```bash
+chmod +x pow-client-termux-arm64
+./pow-client-termux-arm64
+```
+
 ## 使用说明
 
 1. 启动程序后，选择RPC节点
@@ -49,7 +79,8 @@ cargo build --release
 本项目使用GitHub Actions自动构建多平台可执行文件：
 - Windows (x86_64)
 - Linux (x86_64)
-- Linux ARM64 (适用于ARM设备，如手机)
+- Linux ARM64 (适用于ARM设备)
+- Android Termux (ARM64)
 
 每当推送带有`v`前缀的标签（如`v0.1.0`）时，会自动触发构建流程并发布Release。
 
