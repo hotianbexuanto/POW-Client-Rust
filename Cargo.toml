@@ -21,6 +21,7 @@ num-traits = "0.2"
 dotenv = "0.15"
 lazy_static = "1.4"
 futures = "0.3"
+futures-util = { version = "0.3", features = ["futures-sink", "futures-io", "std"] }
 rand = "0.8"
 clap = { version = "4.3", features = ["derive"] }
 num_cpus = "1.16"
