@@ -45,21 +45,73 @@ async fn main() -> Result<()> {
 
     print_welcome_message();
 
-    // 选择RPC节点
-    let rpc_url = select_rpc_node(&app_state).await?;
-    println!(
-        "{}",
-        format!("已选择 RPC / Selected RPC: {}", rpc_url).green()
-    );
+    // 尝试连接RPC节点
+    let mut rpc_url = None;
+    let mut provider = None;
 
-    // 添加到日志
-    app_state
-        .lock()
-        .unwrap()
-        .add_log(format!("已选择 RPC: {}", rpc_url), LogLevel::Info);
+    // 最多尝试3次连接RPC
+    for _ in 0..3 {
+        // 选择RPC节点
+        match select_rpc_node(&app_state).await {
+            Ok(selected_rpc) => {
+                println!(
+                    "{}",
+                    format!("已选择 RPC / Selected RPC: {}", selected_rpc).green()
+                );
 
-    // 初始化以太坊提供者
-    let provider = Provider::<Http>::try_from(rpc_url)?;
+                // 添加到日志
+                app_state
+                    .lock()
+                    .unwrap()
+                    .add_log(format!("已选择 RPC: {}", selected_rpc), LogLevel::Info);
+
+                // 初始化以太坊提供者
+                match Provider::<Http>::try_from(selected_rpc) {
+                    Ok(provider_instance) => {
+                        rpc_url = Some(selected_rpc);
+                        provider = Some(provider_instance);
+                        break;
+                    }
+                    Err(e) => {
+                        let error_msg = format!("连接RPC节点失败: {}. 尝试其他节点。", e);
+                        println!("{}", error_msg.yellow());
+                        app_state
+                            .lock()
+                            .unwrap()
+                            .add_log(error_msg, LogLevel::Warning);
+
+                        // 关闭自动选择，以便下次手动选择
+                        app_state.lock().unwrap().config.auto_select_rpc = false;
+                    }
+                }
+            }
+            Err(e) => {
+                let error_msg = format!("选择RPC节点失败: {}. 尝试其他节点。", e);
+                println!("{}", error_msg.yellow());
+                app_state
+                    .lock()
+                    .unwrap()
+                    .add_log(error_msg, LogLevel::Warning);
+
+                // 关闭自动选择，以便下次手动选择
+                app_state.lock().unwrap().config.auto_select_rpc = false;
+            }
+        }
+    }
+
+    // 如果所有尝试都失败，返回错误
+    if provider.is_none() {
+        let error_msg = "无法连接到任何RPC节点，请检查网络连接后重试";
+        println!("{}", error_msg.red());
+        app_state
+            .lock()
+            .unwrap()
+            .add_log(error_msg.to_string(), LogLevel::Error);
+        return Err(anyhow!(error_msg));
+    }
+
+    let provider = provider.unwrap();
+    let rpc_url = rpc_url.unwrap();
 
     // 显示链ID信息
     match provider.get_chainid().await {
@@ -370,19 +422,34 @@ async fn update_wallet_balance<M: Middleware + 'static>(
     let balance_eth = ethers::utils::format_ether(balance);
     let balance_f64 = balance_eth.parse::<f64>().unwrap_or(0.0);
 
-    // 更新应用状态中的钱包信息
+    // 更新应用状态中的钱包信息和挖矿总量
     let wallet_address = wallet.address();
-    app_state
-        .lock()
-        .unwrap()
-        .update_wallet_info(wallet_address, balance_f64);
 
     // 添加日志
+    let previous_balance = app_state.lock().unwrap().wallet_balance;
     let balance_msg = format!("钱包余额已更新: {} MAG", balance_f64);
     app_state
         .lock()
         .unwrap()
         .add_log(balance_msg, LogLevel::Info);
+
+    // 更新钱包信息（这也会调用update_total_mined_from_balance）
+    app_state
+        .lock()
+        .unwrap()
+        .update_wallet_info(wallet_address, balance_f64);
+
+    // 如果余额增加，记录余额变化
+    if let Some(prev_balance) = previous_balance {
+        if balance_f64 > prev_balance {
+            let earned = balance_f64 - prev_balance;
+            let earn_msg = format!("钱包余额增加了 {:.4} MAG", earned);
+            app_state
+                .lock()
+                .unwrap()
+                .add_log(earn_msg, LogLevel::Success);
+        }
+    }
 
     Ok(())
 }
@@ -403,8 +470,8 @@ async fn start_mining_loop<M: Middleware + 'static>(
     let balance_update_contract = contract.clone();
     let balance_update_app_state = app_state.clone();
     tokio::spawn(async move {
-        // 每60秒更新一次钱包余额
-        let update_interval = Duration::from_secs(60);
+        // 每30秒更新一次钱包余额，以便更准确地跟踪挖矿收益
+        let update_interval = Duration::from_secs(30);
         loop {
             sleep(update_interval).await;
 
@@ -449,37 +516,105 @@ async fn start_mining_loop<M: Middleware + 'static>(
             submit_app_state
                 .lock()
                 .unwrap()
-                .update_task(submit_task_id, "后台提交中".to_string());
+                .update_task(submit_task_id, "提交中".to_string());
 
-            // 尝试提交解决方案
-            match submit_solution(
-                &submit_contract,
-                submit_task_id,
-                solution,
-                &submit_app_state,
-            )
-            .await
-            {
-                Ok(_) => {
-                    // 提交成功
-                    let success_msg = format!("任务 {} 后台提交成功", submit_task_id);
+            // 执行提交
+            match submit_contract.submit_mining_result(solution).send().await {
+                Ok(tx) => {
+                    let result_msg = format!("任务 {} 的解决方案已提交，等待确认", submit_task_id);
                     submit_app_state
                         .lock()
                         .unwrap()
-                        .add_log(success_msg, LogLevel::Success);
+                        .add_log(result_msg, LogLevel::Info);
 
-                    // 更新钱包余额
-                    if let Err(e) = update_wallet_balance(&submit_contract, &submit_app_state).await
-                    {
-                        let error_msg = format!("提交后更新钱包余额失败: {}", e);
-                        submit_app_state
-                            .lock()
-                            .unwrap()
-                            .add_log(error_msg, LogLevel::Error);
+                    // 等待交易确认
+                    match tx.await {
+                        Ok(Some(receipt)) => {
+                            // 检查交易状态
+                            if receipt.status.unwrap_or_default() == U64::from(1) {
+                                let success_msg =
+                                    format!("任务 {} 的解决方案已确认，交易成功", submit_task_id);
+                                submit_app_state
+                                    .lock()
+                                    .unwrap()
+                                    .add_log(success_msg, LogLevel::Success);
+
+                                // 更新任务状态为成功
+                                submit_app_state
+                                    .lock()
+                                    .unwrap()
+                                    .update_task(submit_task_id, "成功".to_string());
+
+                                // 在提交成功后更新钱包余额
+                                if let Err(e) =
+                                    update_wallet_balance(&submit_contract, &submit_app_state).await
+                                {
+                                    let error_msg = format!(
+                                        "任务 {} 提交后更新钱包余额失败: {}",
+                                        submit_task_id, e
+                                    );
+                                    submit_app_state
+                                        .lock()
+                                        .unwrap()
+                                        .add_log(error_msg, LogLevel::Warning);
+                                } else {
+                                    let update_msg = format!(
+                                        "任务 {} 提交成功后更新钱包余额成功",
+                                        submit_task_id
+                                    );
+                                    submit_app_state
+                                        .lock()
+                                        .unwrap()
+                                        .add_log(update_msg, LogLevel::Success);
+                                }
+                            } else {
+                                let error_msg = format!(
+                                    "任务 {} 的解决方案交易失败，请检查链上状态",
+                                    submit_task_id
+                                );
+                                submit_app_state
+                                    .lock()
+                                    .unwrap()
+                                    .add_log(error_msg, LogLevel::Error);
+
+                                // 更新任务状态为交易失败
+                                submit_app_state
+                                    .lock()
+                                    .unwrap()
+                                    .update_task(submit_task_id, "交易失败".to_string());
+                            }
+                        }
+                        Ok(None) => {
+                            let error_msg =
+                                format!("任务 {} 的解决方案交易未能确认", submit_task_id);
+                            submit_app_state
+                                .lock()
+                                .unwrap()
+                                .add_log(error_msg, LogLevel::Error);
+
+                            // 更新任务状态为失败
+                            submit_app_state
+                                .lock()
+                                .unwrap()
+                                .update_task(submit_task_id, "确认失败".to_string());
+                        }
+                        Err(e) => {
+                            let error_msg =
+                                format!("任务 {} 的解决方案确认失败: {}", submit_task_id, e);
+                            submit_app_state
+                                .lock()
+                                .unwrap()
+                                .add_log(error_msg, LogLevel::Error);
+
+                            // 更新任务状态为失败
+                            submit_app_state
+                                .lock()
+                                .unwrap()
+                                .update_task(submit_task_id, "确认失败".to_string());
+                        }
                     }
                 }
                 Err(e) => {
-                    // 提交失败 - 更新任务状态为提交失败
                     let error_msg = format!("任务 {} 后台提交失败: {}", submit_task_id, e);
                     submit_app_state
                         .lock()
@@ -662,31 +797,6 @@ async fn request_and_calculate<M: Middleware + 'static>(
 
     // 返回解决方案供后续提交
     Ok(solution)
-}
-
-// 提交解决方案函数
-async fn submit_solution<M: Middleware + 'static>(
-    contract: &MiningContract<SignerMiddleware<M, LocalWallet>>,
-    task_id: usize,
-    solution: U256,
-    app_state: &Arc<Mutex<App>>,
-) -> Result<()> {
-    // 提交解决方案
-    let submit_request = contract.submit_mining_result(solution);
-    let pending_tx = submit_request.send().await?;
-    let receipt = pending_tx.await?;
-
-    if receipt.is_none() {
-        return Err(anyhow!("提交解决方案的交易确认失败"));
-    }
-
-    // 更新任务状态
-    app_state
-        .lock()
-        .unwrap()
-        .update_task(task_id, "成功".to_string());
-
-    Ok(())
 }
 
 async fn await_solution(
@@ -992,8 +1102,10 @@ fn encode_packed(tokens: &[Token]) -> Result<Vec<u8>> {
 
 // 配置挖矿参数
 fn configure_mining_parameters(app_state: &Arc<Mutex<App>>) {
-    // 默认值
-    let default_thread_count = app_state.lock().unwrap().config.thread_count;
+    // 获取当前配置
+    let current_config = app_state.lock().unwrap().config.clone();
+    let default_thread_count = current_config.thread_count;
+    let default_auto_select_rpc = current_config.auto_select_rpc;
     let cpu_count = num_cpus::get();
 
     // 说明挖矿模式
@@ -1029,14 +1141,49 @@ fn configure_mining_parameters(app_state: &Arc<Mutex<App>>) {
         .interact()
         .unwrap_or(default_thread_count);
 
-    // 更新配置 - 保持任务数为1
+    // 询问是否自动选择RPC节点
+    println!(
+        "{}",
+        "RPC节点自动选择将测试多个节点并选择响应最快的一个"
+            .bold()
+            .cyan()
+    );
+    println!(
+        "当前设置: {}",
+        if default_auto_select_rpc {
+            "自动选择"
+        } else {
+            "手动选择"
+        }
+    );
+
+    let auto_select_options = ["自动选择 RPC 节点", "手动选择 RPC 节点"];
+    let auto_select_default = if default_auto_select_rpc { 0 } else { 1 };
+
+    let auto_select_index = Select::new()
+        .with_prompt("选择 RPC 节点获取方式")
+        .default(auto_select_default)
+        .items(&auto_select_options)
+        .interact()
+        .unwrap_or(auto_select_default);
+
+    let auto_select_rpc = auto_select_index == 0;
+
+    // 更新配置
     let mut app = app_state.lock().unwrap();
     app.config.task_count = 1; // 固定为1个任务
     app.config.thread_count = thread_count;
+    app.config.auto_select_rpc = auto_select_rpc;
 
+    // 输出配置信息
     let config_msg = format!(
-        "已设置挖矿配置 - 使用 {} 个线程全力处理单个任务",
-        thread_count
+        "已设置挖矿配置 - 使用 {} 个线程全力处理单个任务，RPC节点获取方式: {}",
+        thread_count,
+        if auto_select_rpc {
+            "自动选择"
+        } else {
+            "手动选择"
+        }
     );
     println!("{}", config_msg.green());
     app.add_log(config_msg, LogLevel::Info);

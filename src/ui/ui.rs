@@ -98,8 +98,9 @@ fn render_wallet_info<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
             }),
         ]),
         Line::from(vec![
-            Span::styled("挖矿获得: ", Style::default().fg(Color::Green)),
-            Span::raw(format!("{:.2} MAG", app.mining_status.total_mined)),
+            Span::styled("挖矿收益: ", Style::default().fg(Color::Green)),
+            Span::raw(format!("{:.4} MAG", app.mining_status.total_mined)),
+            Span::styled(" (基于余额变化)", Style::default().fg(Color::DarkGray)),
         ]),
     ];
 
@@ -223,8 +224,9 @@ fn render_mining_summary<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(format!("{}", submitting_count)),
         ]),
         Line::from(vec![
-            Span::styled("挖矿获得: ", Style::default().fg(Color::Green)),
-            Span::raw(format!("{:.2} MAG", app.mining_status.total_mined)),
+            Span::styled("挖矿收益: ", Style::default().fg(Color::Green)),
+            Span::raw(format!("{:.4} MAG", app.mining_status.total_mined)),
+            Span::styled(" (实际到账)", Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
             Span::styled("运行时间: ", Style::default().fg(Color::Yellow)),

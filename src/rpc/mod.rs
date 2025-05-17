@@ -89,7 +89,13 @@ pub async fn find_fastest_rpc(app_state: &Arc<Mutex<App>>) -> Result<&'static st
     let response_times = test_all_rpc_nodes(app_state).await?;
 
     if response_times.is_empty() {
-        return Err(anyhow!("所有RPC节点都不可用"));
+        let error_msg = "所有RPC节点都不可用，请检查网络连接或手动选择节点";
+        println!("{}", error_msg.red());
+        app_state
+            .lock()
+            .unwrap()
+            .add_log(error_msg.to_string(), crate::ui::app::LogLevel::Error);
+        return Err(anyhow!(error_msg));
     }
 
     // 输出所有节点的响应时间
@@ -104,7 +110,15 @@ pub async fn find_fastest_rpc(app_state: &Arc<Mutex<App>>) -> Result<&'static st
         .filter(|&rpc| response_times.contains_key(rpc))
         .min_by_key(|&rpc| response_times.get(rpc).unwrap_or(&u64::MAX))
         .copied()
-        .ok_or_else(|| anyhow!("找不到可用的RPC节点"))?;
+        .ok_or_else(|| {
+            let error_msg = "无法确定最快的RPC节点，请手动选择节点";
+            println!("{}", error_msg.red());
+            app_state
+                .lock()
+                .unwrap()
+                .add_log(error_msg.to_string(), crate::ui::app::LogLevel::Error);
+            anyhow!(error_msg)
+        })?;
 
     app_state.lock().unwrap().current_rpc = Some(fastest_rpc.to_string());
 
@@ -124,40 +138,70 @@ pub async fn find_fastest_rpc(app_state: &Arc<Mutex<App>>) -> Result<&'static st
 
 // 手动选择RPC节点
 pub async fn select_rpc_node(app_state: &Arc<Mutex<App>>) -> Result<&'static str> {
-    // 如果启用了自动选择，则找到最快的节点
+    // 如果启用了自动选择，则尝试找到最快的节点
     if app_state.lock().unwrap().config.auto_select_rpc {
-        find_fastest_rpc(app_state).await
-    } else {
-        // 否则使用第一个节点（这里可以添加交互式选择逻辑）
-        let rpc = RPC_OPTIONS[0];
-
-        // 测试所选节点的可用性
-        match test_rpc_node(rpc).await {
-            Ok(response_time) => {
-                app_state
-                    .lock()
-                    .unwrap()
-                    .update_rpc_response_time(rpc.to_string(), response_time);
-                app_state.lock().unwrap().current_rpc = Some(rpc.to_string());
-
-                let log_msg = format!("手动选择RPC节点: {} ({}ms)", rpc, response_time);
-                app_state
-                    .lock()
-                    .unwrap()
-                    .add_log(log_msg, crate::ui::app::LogLevel::Info);
-
-                Ok(rpc)
-            }
+        match find_fastest_rpc(app_state).await {
+            Ok(fastest_rpc) => return Ok(fastest_rpc),
             Err(e) => {
-                let error_msg = format!("所选RPC节点不可用: {}", e);
+                let error_msg = format!("自动选择RPC节点失败: {}. 将切换到手动选择模式。", e);
+                println!("{}", error_msg.yellow());
                 app_state
                     .lock()
                     .unwrap()
-                    .add_log(error_msg, crate::ui::app::LogLevel::Error);
+                    .add_log(error_msg, crate::ui::app::LogLevel::Warning);
 
-                // 如果手动选择的节点不可用，尝试找到可用的节点
-                find_fastest_rpc(app_state).await
+                // 自动选择失败后，关闭自动选择功能
+                app_state.lock().unwrap().config.auto_select_rpc = false;
+
+                // 继续到手动选择逻辑
             }
+        }
+    }
+
+    // 手动选择逻辑 - 显示所有可用的RPC节点供选择
+    println!("{}", "请选择RPC节点:".cyan());
+    for (idx, &rpc) in RPC_OPTIONS.iter().enumerate() {
+        println!("  {}. {}", idx + 1, rpc);
+    }
+
+    // 使用dialoguer库进行交互式选择
+    let selection = dialoguer::Select::new()
+        .with_prompt("选择 RPC 节点")
+        .default(0)
+        .items(&RPC_OPTIONS)
+        .interact()
+        .map_err(|e| anyhow!("交互选择失败: {}", e))?;
+
+    let selected_rpc = RPC_OPTIONS[selection];
+
+    // 测试所选节点的可用性
+    match test_rpc_node(selected_rpc).await {
+        Ok(response_time) => {
+            app_state
+                .lock()
+                .unwrap()
+                .update_rpc_response_time(selected_rpc.to_string(), response_time);
+            app_state.lock().unwrap().current_rpc = Some(selected_rpc.to_string());
+
+            let log_msg = format!("手动选择RPC节点: {} ({}ms)", selected_rpc, response_time);
+            println!("{}", log_msg.green());
+            app_state
+                .lock()
+                .unwrap()
+                .add_log(log_msg, crate::ui::app::LogLevel::Success);
+
+            Ok(selected_rpc)
+        }
+        Err(e) => {
+            let error_msg = format!("所选RPC节点不可用: {}. 请选择其他节点。", e);
+            println!("{}", error_msg.red());
+            app_state
+                .lock()
+                .unwrap()
+                .add_log(error_msg, crate::ui::app::LogLevel::Error);
+
+            // 使用 Box::pin 来处理递归调用
+            Box::pin(select_rpc_node(app_state)).await
         }
     }
 }

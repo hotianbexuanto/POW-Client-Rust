@@ -78,6 +78,8 @@ pub struct App {
     // 钱包信息
     pub wallet_address: Option<Address>,
     pub wallet_balance: Option<f64>,
+    // 初始钱包余额，用于计算挖矿收益
+    pub initial_wallet_balance: Option<f64>,
     // 合约信息
     pub contract_address: Option<Address>,
     pub contract_balance: Option<f64>,
@@ -104,6 +106,7 @@ impl App {
             config: AppConfig::default(),
             wallet_address: None,
             wallet_balance: None,
+            initial_wallet_balance: None,
             contract_address: None,
             contract_balance: None,
             tasks: Vec::new(),
@@ -196,8 +199,36 @@ impl App {
 
     // 更新钱包信息
     pub fn update_wallet_info(&mut self, address: Address, balance: f64) {
+        // 如果是首次更新余额，则设置初始余额
+        if self.wallet_balance.is_none() && self.initial_wallet_balance.is_none() {
+            self.initial_wallet_balance = Some(balance);
+        }
+
+        // 更新钱包地址和当前余额
         self.wallet_address = Some(address);
         self.wallet_balance = Some(balance);
+
+        // 使用钱包余额变化来计算挖矿总量
+        self.update_total_mined_from_balance();
+    }
+
+    // 使用钱包余额变化计算挖矿总量
+    pub fn update_total_mined_from_balance(&mut self) {
+        if let (Some(current_balance), Some(initial_balance)) =
+            (self.wallet_balance, self.initial_wallet_balance)
+        {
+            // 如果当前余额高于初始余额，则差额即为挖矿所得
+            if current_balance > initial_balance {
+                self.mining_status.total_mined = current_balance - initial_balance;
+
+                // 添加日志记录挖矿收益更新
+                let mining_msg = format!(
+                    "根据钱包余额变化更新挖矿收益: {:.4} MAG",
+                    self.mining_status.total_mined
+                );
+                self.add_log(mining_msg, LogLevel::Info);
+            }
+        }
     }
 
     // 更新合约信息
@@ -213,11 +244,10 @@ impl App {
         self.mining_status.uptime += 1; // 每次更新增加1秒
     }
 
-    // 增加解决方案计数
+    // 增加解决方案计数 - 不再更新挖矿收益，只更新解决方案计数
     pub fn add_solution_found(&mut self) {
         self.mining_status.total_solutions_found += 1;
-        // 每次找到解决方案，增加3 MAG的奖励
-        self.mining_status.total_mined += 3.0;
+        // 不再直接增加挖矿收益，而是通过钱包余额对比来计算
     }
 
     // 更新RPC节点响应时间
