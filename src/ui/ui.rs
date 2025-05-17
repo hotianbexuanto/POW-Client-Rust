@@ -197,6 +197,12 @@ fn render_mining_summary<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
         .filter(|t| t.status.contains("后台提交") || t.status == "提交中")
         .count();
 
+    // 计算活跃任务数
+    let active_tasks = app.mining_status.active_tasks;
+
+    // 计算计算中的任务数量
+    let calculating_count = app.tasks.iter().filter(|t| t.status == "计算中").count();
+
     // 挖矿摘要信息
     let mining_summary = vec![
         Line::from(vec![
@@ -205,10 +211,13 @@ fn render_mining_summary<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("工作模式: ", Style::default().fg(Color::Yellow)),
-            Span::styled("不等待提交", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{}任务并行", active_tasks),
+                Style::default().fg(Color::Cyan),
+            ),
         ]),
         Line::from(vec![
-            Span::styled("线程数: ", Style::default().fg(Color::Yellow)),
+            Span::styled("每任务线程: ", Style::default().fg(Color::Yellow)),
             Span::raw(format!("{}", app.config.thread_count)),
         ]),
         Line::from(vec![
@@ -218,6 +227,10 @@ fn render_mining_summary<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("找到解决方案: ", Style::default().fg(Color::Yellow)),
             Span::raw(format!("{}", app.mining_status.total_solutions_found)),
+        ]),
+        Line::from(vec![
+            Span::styled("当前计算中: ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{}", calculating_count)),
         ]),
         Line::from(vec![
             Span::styled("后台提交中: ", Style::default().fg(Color::Blue)),
@@ -255,42 +268,42 @@ fn render_task_list<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
     });
     let header = Row::new(header_cells).style(Style::default().fg(Color::Yellow));
 
-    // 任务行 - 显示所有活跃任务和正在提交的任务
-    let mut rows = Vec::new();
-
-    // 找出所有活跃的计算任务
-    let active_tasks: Vec<&TaskInfo> = app
+    // 查找当前计算中的任务
+    let calculating_tasks: Vec<&TaskInfo> = app
         .tasks
         .iter()
-        .filter(|t| t.status == "计算中" || t.status == "请求中" || t.status == "处理中")
+        .filter(|t| t.status == "计算中" || t.status == "请求中")
         .collect();
 
-    // 找出正在提交的任务
-    let submitting_tasks: Vec<&TaskInfo> =
-        app.tasks.iter().filter(|t| t.status == "提交中").collect();
-
-    // 找出最近完成的任务（成功或失败）- 限制最多显示5个
-    let completed_tasks: Vec<&TaskInfo> = app
+    // 查找正在后台提交的任务
+    let submitting_tasks: Vec<&TaskInfo> = app
         .tasks
         .iter()
         .filter(|t| {
-            t.status == "成功"
-                || t.status == "提交失败"
-                || t.status == "确认失败"
-                || t.status == "交易失败"
+            (t.status.contains("后台提交") || t.status == "提交中") && t.status != "提交失败"
         })
-        .take(5)
         .collect();
 
-    // 添加所有活跃的计算任务
-    for task in active_tasks {
+    // 查找最近完成的任务（成功或失败）
+    let completed_tasks: Vec<&TaskInfo> = app
+        .tasks
+        .iter()
+        .filter(|t| t.status == "成功" || t.status.contains("失败"))
+        .take(3) // 最多显示3个已完成任务
+        .collect();
+
+    // 任务行
+    let mut rows = Vec::new();
+
+    // 添加所有计算中的任务
+    for task in calculating_tasks {
         let id = task.id.to_string();
         let nonce = match task.nonce {
-            Some(n) => format!("{}", n),
+            Some(n) => format!("{:?}", n),
             None => "-".to_string(),
         };
         let difficulty = match task.difficulty {
-            Some(d) => format!("{}", d),
+            Some(d) => format!("{:?}", d),
             None => "-".to_string(),
         };
         let status = task.status.clone();
@@ -312,15 +325,15 @@ fn render_task_list<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
         rows.push(Row::new(cells));
     }
 
-    // 添加所有正在提交的任务
+    // 添加所有后台提交中的任务
     for task in submitting_tasks {
         let id = task.id.to_string();
         let nonce = match task.nonce {
-            Some(n) => format!("{}", n),
+            Some(n) => format!("{:?}", n),
             None => "-".to_string(),
         };
         let difficulty = match task.difficulty {
-            Some(d) => format!("{}", d),
+            Some(d) => format!("{:?}", d),
             None => "-".to_string(),
         };
         let status = task.status.clone();
@@ -329,7 +342,7 @@ fn render_task_list<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
             None => "-".to_string(),
         };
 
-        let status_style = Style::default().fg(Color::Blue);
+        let status_style = Style::default().fg(Color::Blue); // 后台提交用蓝色显示
 
         let cells = vec![
             Span::raw(id),
@@ -346,11 +359,11 @@ fn render_task_list<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
     for task in completed_tasks {
         let id = task.id.to_string();
         let nonce = match task.nonce {
-            Some(n) => format!("{}", n),
+            Some(n) => format!("{:?}", n),
             None => "-".to_string(),
         };
         let difficulty = match task.difficulty {
-            Some(d) => format!("{}", d),
+            Some(d) => format!("{:?}", d),
             None => "-".to_string(),
         };
         let status = task.status.clone();
@@ -361,7 +374,7 @@ fn render_task_list<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
 
         let status_style = match status.as_str() {
             "成功" => Style::default().fg(Color::Green),
-            "提交失败" | "确认失败" | "交易失败" => Style::default().fg(Color::Red),
+            "提交失败" | "确认失败" => Style::default().fg(Color::Red),
             _ => Style::default().fg(Color::White),
         };
 

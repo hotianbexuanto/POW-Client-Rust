@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
     }
 
     let provider = provider.unwrap();
+    let rpc_url = rpc_url.unwrap();
 
     // 显示链ID信息
     match provider.get_chainid().await {
@@ -457,13 +458,13 @@ async fn start_mining_loop<M: Middleware + 'static>(
     contract: MiningContract<SignerMiddleware<M, LocalWallet>>,
     app_state: Arc<Mutex<App>>,
 ) -> Result<()> {
-    // 获取用户配置的线程数
-    let configured_thread_count = app_state.lock().unwrap().config.thread_count;
+    // 获取任务和线程配置
+    let task_count = app_state.lock().unwrap().config.task_count;
+    let thread_count = app_state.lock().unwrap().config.thread_count;
 
-    // 更新应用状态 - 更新活跃任务
-    let max_parallel_tasks = 5; // 最多同时处理5个任务
-    app_state.lock().unwrap().mining_status.total_tasks = max_parallel_tasks;
-    app_state.lock().unwrap().mining_status.active_tasks = max_parallel_tasks;
+    // 更新应用状态中的任务数量
+    app_state.lock().unwrap().mining_status.total_tasks = task_count;
+    app_state.lock().unwrap().mining_status.active_tasks = task_count;
 
     // 启动钱包余额定期更新任务
     let balance_update_contract = contract.clone();
@@ -495,21 +496,18 @@ async fn start_mining_loop<M: Middleware + 'static>(
     });
 
     // 创建提交队列
-    let (submit_tx, mut submit_rx) = tokio::sync::mpsc::channel::<(usize, U256)>(20); // 增大队列容量
+    let (submit_tx, mut submit_rx) = tokio::sync::mpsc::channel::<(usize, U256)>(20);
 
     // 启动提交处理任务
     let submit_contract = contract.clone();
     let submit_app_state = app_state.clone();
     tokio::spawn(async move {
-        // 跟踪提交中的任务计数
-        let mut active_submissions = 0;
-        let max_concurrent_submissions = 3; // 最多同时提交3个任务
-
         while let Some((submit_task_id, solution)) = submit_rx.recv().await {
-            // 如果已达最大并发提交数，等待一些任务完成
-            while active_submissions >= max_concurrent_submissions {
-                sleep(Duration::from_millis(100)).await;
-            }
+            let result_msg = format!("后台处理 - 提交任务 {} 的解决方案", submit_task_id);
+            submit_app_state
+                .lock()
+                .unwrap()
+                .add_log(result_msg, LogLevel::Info);
 
             // 更新任务状态为提交中
             submit_app_state
@@ -517,239 +515,198 @@ async fn start_mining_loop<M: Middleware + 'static>(
                 .unwrap()
                 .update_task(submit_task_id, "提交中".to_string());
 
-            // 增加提交中的任务计数
-            active_submissions += 1;
+            // 执行提交
+            match submit_contract.submit_mining_result(solution).send().await {
+                Ok(tx) => {
+                    let result_msg = format!("任务 {} 的解决方案已提交，等待确认", submit_task_id);
+                    submit_app_state
+                        .lock()
+                        .unwrap()
+                        .add_log(result_msg, LogLevel::Info);
 
-            // 克隆需要在新任务中使用的变量
-            let task_contract = submit_contract.clone();
-            let task_app_state = submit_app_state.clone();
+                    // 等待交易确认
+                    match tx.await {
+                        Ok(Some(receipt)) => {
+                            // 检查交易状态
+                            if receipt.status.unwrap_or_default() == U64::from(1) {
+                                let success_msg =
+                                    format!("任务 {} 的解决方案已确认，交易成功", submit_task_id);
+                                submit_app_state
+                                    .lock()
+                                    .unwrap()
+                                    .add_log(success_msg, LogLevel::Success);
 
-            // 在新的任务中处理提交，避免阻塞主提交循环
-            tokio::spawn(async move {
-                let result_msg = format!("后台处理 - 提交任务 {} 的解决方案", submit_task_id);
-                task_app_state
-                    .lock()
-                    .unwrap()
-                    .add_log(result_msg, LogLevel::Info);
+                                // 更新任务状态为成功
+                                submit_app_state
+                                    .lock()
+                                    .unwrap()
+                                    .update_task(submit_task_id, "成功".to_string());
 
-                // 执行提交
-                match task_contract.submit_mining_result(solution).send().await {
-                    Ok(tx) => {
-                        let result_msg =
-                            format!("任务 {} 的解决方案已提交，等待确认", submit_task_id);
-                        task_app_state
-                            .lock()
-                            .unwrap()
-                            .add_log(result_msg, LogLevel::Info);
-
-                        // 等待交易确认
-                        match tx.await {
-                            Ok(Some(receipt)) => {
-                                // 检查交易状态
-                                if receipt.status.unwrap_or_default() == U64::from(1) {
-                                    let success_msg = format!(
-                                        "任务 {} 的解决方案已确认，交易成功",
-                                        submit_task_id
-                                    );
-                                    task_app_state
-                                        .lock()
-                                        .unwrap()
-                                        .add_log(success_msg, LogLevel::Success);
-
-                                    // 更新任务状态为成功
-                                    task_app_state
-                                        .lock()
-                                        .unwrap()
-                                        .update_task(submit_task_id, "成功".to_string());
-
-                                    // 在提交成功后更新钱包余额
-                                    if let Err(e) =
-                                        update_wallet_balance(&task_contract, &task_app_state).await
-                                    {
-                                        let error_msg = format!(
-                                            "任务 {} 提交后更新钱包余额失败: {}",
-                                            submit_task_id, e
-                                        );
-                                        task_app_state
-                                            .lock()
-                                            .unwrap()
-                                            .add_log(error_msg, LogLevel::Warning);
-                                    } else {
-                                        let update_msg = format!(
-                                            "任务 {} 提交成功后更新钱包余额成功",
-                                            submit_task_id
-                                        );
-                                        task_app_state
-                                            .lock()
-                                            .unwrap()
-                                            .add_log(update_msg, LogLevel::Success);
-                                    }
-                                } else {
+                                // 在提交成功后更新钱包余额
+                                if let Err(e) =
+                                    update_wallet_balance(&submit_contract, &submit_app_state).await
+                                {
                                     let error_msg = format!(
-                                        "任务 {} 的解决方案交易失败，请检查链上状态",
+                                        "任务 {} 提交后更新钱包余额失败: {}",
+                                        submit_task_id, e
+                                    );
+                                    submit_app_state
+                                        .lock()
+                                        .unwrap()
+                                        .add_log(error_msg, LogLevel::Warning);
+                                } else {
+                                    let update_msg = format!(
+                                        "任务 {} 提交成功后更新钱包余额成功",
                                         submit_task_id
                                     );
-                                    task_app_state
+                                    submit_app_state
                                         .lock()
                                         .unwrap()
-                                        .add_log(error_msg, LogLevel::Error);
-
-                                    // 更新任务状态为交易失败
-                                    task_app_state
-                                        .lock()
-                                        .unwrap()
-                                        .update_task(submit_task_id, "交易失败".to_string());
+                                        .add_log(update_msg, LogLevel::Success);
                                 }
-                            }
-                            Ok(None) => {
-                                let error_msg =
-                                    format!("任务 {} 的解决方案交易未能确认", submit_task_id);
-                                task_app_state
+                            } else {
+                                let error_msg = format!(
+                                    "任务 {} 的解决方案交易失败，请检查链上状态",
+                                    submit_task_id
+                                );
+                                submit_app_state
                                     .lock()
                                     .unwrap()
                                     .add_log(error_msg, LogLevel::Error);
 
-                                // 更新任务状态为失败
-                                task_app_state
+                                // 更新任务状态为交易失败
+                                submit_app_state
                                     .lock()
                                     .unwrap()
-                                    .update_task(submit_task_id, "确认失败".to_string());
-                            }
-                            Err(e) => {
-                                let error_msg =
-                                    format!("任务 {} 的解决方案确认失败: {}", submit_task_id, e);
-                                task_app_state
-                                    .lock()
-                                    .unwrap()
-                                    .add_log(error_msg, LogLevel::Error);
-
-                                // 更新任务状态为失败
-                                task_app_state
-                                    .lock()
-                                    .unwrap()
-                                    .update_task(submit_task_id, "确认失败".to_string());
+                                    .update_task(submit_task_id, "交易失败".to_string());
                             }
                         }
-                    }
-                    Err(e) => {
-                        let error_msg = format!("任务 {} 后台提交失败: {}", submit_task_id, e);
-                        task_app_state
-                            .lock()
-                            .unwrap()
-                            .add_log(error_msg, LogLevel::Error);
+                        Ok(None) => {
+                            let error_msg =
+                                format!("任务 {} 的解决方案交易未能确认", submit_task_id);
+                            submit_app_state
+                                .lock()
+                                .unwrap()
+                                .add_log(error_msg, LogLevel::Error);
 
-                        // 更新任务状态为提交失败
-                        task_app_state
-                            .lock()
-                            .unwrap()
-                            .update_task(submit_task_id, "提交失败".to_string());
+                            // 更新任务状态为失败
+                            submit_app_state
+                                .lock()
+                                .unwrap()
+                                .update_task(submit_task_id, "确认失败".to_string());
+                        }
+                        Err(e) => {
+                            let error_msg =
+                                format!("任务 {} 的解决方案确认失败: {}", submit_task_id, e);
+                            submit_app_state
+                                .lock()
+                                .unwrap()
+                                .add_log(error_msg, LogLevel::Error);
+
+                            // 更新任务状态为失败
+                            submit_app_state
+                                .lock()
+                                .unwrap()
+                                .update_task(submit_task_id, "确认失败".to_string());
+                        }
                     }
                 }
+                Err(e) => {
+                    let error_msg = format!("任务 {} 后台提交失败: {}", submit_task_id, e);
+                    submit_app_state
+                        .lock()
+                        .unwrap()
+                        .add_log(error_msg, LogLevel::Error);
 
-                // 减少提交中的任务计数
-                active_submissions -= 1;
-            });
+                    // 更新任务状态为提交失败，这样UI就不会继续显示它
+                    submit_app_state
+                        .lock()
+                        .unwrap()
+                        .update_task(submit_task_id, "提交失败".to_string());
+                }
+            }
         }
     });
 
     // 任务ID计数器
     let mut task_id = 0;
 
-    // 并行处理多个任务
-    let mut handles = Vec::new();
-    let max_concurrent_tasks = max_parallel_tasks; // 最多同时处理5个任务
-    let mut active_task_count = 0;
+    // 创建多个挖矿任务处理器
+    let mut task_handles = Vec::new();
 
-    // 每个任务通知主线程更新状态和线程计数
-    let (task_status_tx, mut task_status_rx) = tokio::sync::mpsc::channel::<(usize, bool)>(20);
+    // 启动指定数量的挖矿任务
+    for i in 0..task_count {
+        let task_contract = contract.clone();
+        let task_app_state = app_state.clone();
+        let task_submit_tx = submit_tx.clone();
 
-    // 启动一个线程来监控任务状态更新
-    let status_app_state = app_state.clone();
-    tokio::spawn(async move {
-        while let Some((task_id, active)) = task_status_rx.recv().await {
-            if active {
-                // 任务开始执行
-                status_app_state
-                    .lock()
-                    .unwrap()
-                    .add_log(format!("任务 {} 开始执行", task_id), LogLevel::Info);
+        let task_name = format!("挖矿任务-{}", i);
+        let task_info = format!("启动并行挖矿任务 #{}", i);
+        task_app_state
+            .lock()
+            .unwrap()
+            .add_log(task_info, LogLevel::Info);
 
-                // 确保使用用户配置的线程数
-                status_app_state.lock().unwrap().add_log(
-                    format!("任务 {} 使用 {} 个线程", task_id, configured_thread_count),
-                    LogLevel::Info,
-                );
-            } else {
-                // 任务完成
-                status_app_state
-                    .lock()
-                    .unwrap()
-                    .add_log(format!("任务 {} 已完成", task_id), LogLevel::Info);
-            }
-        }
-    });
+        // 为每个任务分配不同的起始ID，避免任务ID冲突
+        let start_task_id = task_id;
+        task_id += 1;
 
-    // 主循环 - 保持最大并发任务数
-    loop {
-        // 清理已完成的任务
-        handles.retain(|h: &tokio::task::JoinHandle<()>| !h.is_finished());
+        // 启动独立挖矿任务
+        let handle = tokio::spawn(async move {
+            let mut current_task_id = start_task_id;
 
-        // 更新活跃任务数
-        active_task_count = handles.len();
-        app_state.lock().unwrap().mining_status.active_tasks = active_task_count;
-
-        // 如果活跃任务数小于最大并发数，创建新任务
-        while active_task_count < max_concurrent_tasks {
-            let contract_clone = contract.clone();
-            let app_state_clone = app_state.clone();
-            let submit_tx_clone = submit_tx.clone();
-            let current_task_id = task_id;
-            let task_status_tx_clone = task_status_tx.clone();
-
-            // 启动新的挖矿任务
-            let handle = tokio::spawn(async move {
-                // 通知任务开始
-                let _ = task_status_tx_clone.send((current_task_id, true)).await;
-
-                // 执行挖矿计算
-                if let Err(e) = mine_calculate_only(
-                    &contract_clone,
+            loop {
+                // 创建新的挖矿任务 - 不等待提交完成
+                let mine_result = mine_calculate_only(
+                    &task_contract,
                     current_task_id,
-                    &app_state_clone,
-                    submit_tx_clone,
+                    &task_app_state,
+                    task_submit_tx.clone(),
                 )
-                .await
-                {
-                    let error_msg = format!("任务 {} 计算失败: {}", current_task_id, e);
-                    app_state_clone
-                        .lock()
-                        .unwrap()
-                        .add_log(error_msg, LogLevel::Error);
-                } else {
-                    let success_msg = format!("任务 {} 计算完成，后台提交中", current_task_id);
-                    app_state_clone
-                        .lock()
-                        .unwrap()
-                        .add_log(success_msg, LogLevel::Success);
+                .await;
+
+                // 处理挖矿结果
+                match mine_result {
+                    Ok(()) => {
+                        let success_msg = format!("任务 {} 计算完成，后台提交中", current_task_id);
+                        task_app_state
+                            .lock()
+                            .unwrap()
+                            .add_log(success_msg, LogLevel::Success);
+                    }
+                    Err(e) => {
+                        let error_msg = format!("任务 {} 计算失败: {}", current_task_id, e);
+                        task_app_state
+                            .lock()
+                            .unwrap()
+                            .add_log(error_msg, LogLevel::Error);
+                    }
                 }
 
-                // 通知任务结束
-                let _ = task_status_tx_clone.send((current_task_id, false)).await;
-            });
+                // 增加任务ID，准备下一个任务
+                current_task_id += task_count;
 
-            handles.push(handle);
-            task_id += 1;
-            active_task_count += 1;
+                // 每10个任务清理一次，保留最近的任务数量 * 2个已完成任务
+                if current_task_id % 10 == 0 {
+                    task_app_state
+                        .lock()
+                        .unwrap()
+                        .clean_old_tasks(task_count * 2);
+                }
 
-            // 每10个任务清理一次，保留最近的10个已完成任务
-            if task_id % 10 == 0 {
-                app_state.lock().unwrap().clean_old_tasks(10);
+                // 无需延迟，立即开始下一个任务
             }
-        }
+        });
 
-        // 短暂休眠，避免CPU利用率过高
-        sleep(Duration::from_millis(100)).await;
+        task_handles.push(handle);
     }
+
+    // 等待所有任务完成（实际上永远不会完成，除非出错）
+    for handle in task_handles {
+        let _ = handle.await;
+    }
+
+    Ok(())
 }
 
 // 专注于挖矿计算的函数，计算完成后将结果发送到提交队列
@@ -1186,6 +1143,7 @@ fn configure_mining_parameters(app_state: &Arc<Mutex<App>>) {
     // 获取当前配置
     let current_config = app_state.lock().unwrap().config.clone();
     let default_thread_count = current_config.thread_count;
+    let default_task_count = current_config.task_count;
     let default_auto_select_rpc = current_config.auto_select_rpc;
     let cpu_count = num_cpus::get();
 
@@ -1198,19 +1156,20 @@ fn configure_mining_parameters(app_state: &Arc<Mutex<App>>) {
     // 说明新的挖矿模式
     println!(
         "{}",
-        "使用单任务多线程模式 - 所有线程集中处理一个任务以提高效率"
+        "使用多任务并行挖矿模式 - 提高挖矿效率和成功率"
             .bold()
             .green()
     );
     println!("系统检测到 {} 个CPU核心", cpu_count);
     println!(
-        "当前线程数: {}，建议值：{}，线程数越多挖矿速度越快",
-        default_thread_count, cpu_count
+        "当前线程数: {}，当前任务数: {}",
+        default_thread_count, default_task_count
     );
+    println!("建议：线程数 * 任务数 <= CPU核心数 * 2，以获得最佳性能");
 
     // 线程数量
     let thread_count: usize = Input::new()
-        .with_prompt("输入挖矿使用的线程数 / Enter number of mining threads")
+        .with_prompt("输入每个任务使用的线程数 / Enter threads per mining task")
         .default(default_thread_count)
         .validate_with(|input: &usize| -> Result<(), &str> {
             if *input > 0 && *input <= cpu_count * 2 {
@@ -1221,6 +1180,20 @@ fn configure_mining_parameters(app_state: &Arc<Mutex<App>>) {
         })
         .interact()
         .unwrap_or(default_thread_count);
+
+    // 任务数量
+    let task_count: usize = Input::new()
+        .with_prompt("输入并行任务数量 / Enter parallel mining tasks")
+        .default(default_task_count)
+        .validate_with(|input: &usize| -> Result<(), &str> {
+            if *input > 0 && *input <= 10 {
+                Ok(())
+            } else {
+                Err(&"任务数必须大于0且不超过10 / Task count must be > 0 and <= 10")
+            }
+        })
+        .interact()
+        .unwrap_or(default_task_count);
 
     // 询问是否自动选择RPC节点
     println!(
@@ -1252,13 +1225,14 @@ fn configure_mining_parameters(app_state: &Arc<Mutex<App>>) {
 
     // 更新配置
     let mut app = app_state.lock().unwrap();
-    app.config.task_count = 1; // 固定为1个任务
+    app.config.task_count = task_count;
     app.config.thread_count = thread_count;
     app.config.auto_select_rpc = auto_select_rpc;
 
     // 输出配置信息
     let config_msg = format!(
-        "已设置挖矿配置 - 使用 {} 个线程全力处理单个任务，RPC节点获取方式: {}",
+        "已设置挖矿配置 - 使用 {} 个任务，每个任务 {} 个线程，RPC节点获取方式: {}",
+        task_count,
         thread_count,
         if auto_select_rpc {
             "自动选择"
