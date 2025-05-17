@@ -255,68 +255,42 @@ fn render_task_list<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
     });
     let header = Row::new(header_cells).style(Style::default().fg(Color::Yellow));
 
-    // 找出最新的计算任务和正在后台提交的任务
-    let latest_task = app.tasks.iter().max_by_key(|t| t.id);
+    // 任务行 - 显示所有活跃任务和正在提交的任务
+    let mut rows = Vec::new();
 
-    // 找出正在后台提交的任务
-    let submitting_tasks: Vec<&TaskInfo> = app
+    // 找出所有活跃的计算任务
+    let active_tasks: Vec<&TaskInfo> = app
+        .tasks
+        .iter()
+        .filter(|t| t.status == "计算中" || t.status == "请求中" || t.status == "处理中")
+        .collect();
+
+    // 找出正在提交的任务
+    let submitting_tasks: Vec<&TaskInfo> =
+        app.tasks.iter().filter(|t| t.status == "提交中").collect();
+
+    // 找出最近完成的任务（成功或失败）- 限制最多显示5个
+    let completed_tasks: Vec<&TaskInfo> = app
         .tasks
         .iter()
         .filter(|t| {
-            (t.status.contains("后台提交") || t.status == "提交中") && t.status != "提交失败"
+            t.status == "成功"
+                || t.status == "提交失败"
+                || t.status == "确认失败"
+                || t.status == "交易失败"
         })
+        .take(5)
         .collect();
 
-    // 任务行 - 显示最新的计算任务和正在提交的任务
-    let mut rows = Vec::new();
-
-    // 添加最新的计算任务
-    if let Some(task) = latest_task {
-        // 只有当最新任务不是提交状态时才显示，避免重复
-        if !task.status.contains("后台提交") && task.status != "提交中" {
-            let id = task.id.to_string();
-            let nonce = match task.nonce {
-                Some(n) => format!("{:?}", n),
-                None => "-".to_string(),
-            };
-            let difficulty = match task.difficulty {
-                Some(d) => format!("{:?}", d),
-                None => "-".to_string(),
-            };
-            let status = task.status.clone();
-            let hash_rate = match task.hash_rate {
-                Some(rate) => format!("{:.2} H/s", rate),
-                None => "-".to_string(),
-            };
-
-            let status_style = match status.as_str() {
-                "成功" => Style::default().fg(Color::Green),
-                "处理中" | "计算中" => Style::default().fg(Color::Yellow),
-                "错误" | "提交失败" => Style::default().fg(Color::Red),
-                _ => Style::default().fg(Color::White),
-            };
-
-            let cells = vec![
-                Span::raw(id),
-                Span::raw(nonce),
-                Span::raw(difficulty),
-                Span::styled(status, status_style),
-                Span::raw(hash_rate),
-            ];
-
-            rows.push(Row::new(cells));
-        }
-    }
-
-    // 添加所有后台提交中的任务
-    for task in submitting_tasks {
+    // 添加所有活跃的计算任务
+    for task in active_tasks {
         let id = task.id.to_string();
         let nonce = match task.nonce {
-            Some(n) => format!("{:?}", n),
+            Some(n) => format!("{}", n),
             None => "-".to_string(),
         };
         let difficulty = match task.difficulty {
-            Some(d) => format!("{:?}", d),
+            Some(d) => format!("{}", d),
             None => "-".to_string(),
         };
         let status = task.status.clone();
@@ -325,7 +299,71 @@ fn render_task_list<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
             None => "-".to_string(),
         };
 
-        let status_style = Style::default().fg(Color::Blue); // 后台提交用蓝色显示
+        let status_style = Style::default().fg(Color::Yellow);
+
+        let cells = vec![
+            Span::raw(id),
+            Span::raw(nonce),
+            Span::raw(difficulty),
+            Span::styled(status, status_style),
+            Span::raw(hash_rate),
+        ];
+
+        rows.push(Row::new(cells));
+    }
+
+    // 添加所有正在提交的任务
+    for task in submitting_tasks {
+        let id = task.id.to_string();
+        let nonce = match task.nonce {
+            Some(n) => format!("{}", n),
+            None => "-".to_string(),
+        };
+        let difficulty = match task.difficulty {
+            Some(d) => format!("{}", d),
+            None => "-".to_string(),
+        };
+        let status = task.status.clone();
+        let hash_rate = match task.hash_rate {
+            Some(rate) => format!("{:.2} H/s", rate),
+            None => "-".to_string(),
+        };
+
+        let status_style = Style::default().fg(Color::Blue);
+
+        let cells = vec![
+            Span::raw(id),
+            Span::raw(nonce),
+            Span::raw(difficulty),
+            Span::styled(status, status_style),
+            Span::raw(hash_rate),
+        ];
+
+        rows.push(Row::new(cells));
+    }
+
+    // 添加最近完成的任务
+    for task in completed_tasks {
+        let id = task.id.to_string();
+        let nonce = match task.nonce {
+            Some(n) => format!("{}", n),
+            None => "-".to_string(),
+        };
+        let difficulty = match task.difficulty {
+            Some(d) => format!("{}", d),
+            None => "-".to_string(),
+        };
+        let status = task.status.clone();
+        let hash_rate = match task.hash_rate {
+            Some(rate) => format!("{:.2} H/s", rate),
+            None => "-".to_string(),
+        };
+
+        let status_style = match status.as_str() {
+            "成功" => Style::default().fg(Color::Green),
+            "提交失败" | "确认失败" | "交易失败" => Style::default().fg(Color::Red),
+            _ => Style::default().fg(Color::White),
+        };
 
         let cells = vec![
             Span::raw(id),
