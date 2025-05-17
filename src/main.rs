@@ -8,13 +8,14 @@ use ethers::{
     prelude::*,
     providers::{Http, JsonRpcClient, Middleware, Provider},
     signers::{coins_bip39::English, LocalWallet, MnemonicBuilder, Signer},
-    types::{Address, BlockNumber, H160, H256, U256},
+    types::{Address, BlockNumber, TransactionReceipt, H160, H256, U256},
     utils::keccak256,
 };
 use lazy_static::lazy_static;
 use num_bigint::BigUint;
 use num_traits::Num;
 use rand::Rng;
+use serde::de::DeserializeOwned;
 use std::{
     collections::HashMap,
     fmt,
@@ -530,108 +531,171 @@ async fn start_mining_loop<M: Middleware + 'static>(
                 .unwrap()
                 .update_task(submit_task_id, "提交中".to_string());
 
-            // 执行提交
-            match submit_contract.submit_mining_result(solution).send().await {
-                Ok(tx) => {
-                    let result_msg = format!("任务 {} 的解决方案已提交，等待确认", submit_task_id);
-                    submit_app_state
-                        .lock()
-                        .unwrap()
-                        .add_log(result_msg, LogLevel::Info);
+            // 获取当前任务信息，验证任务是否仍然有效
+            match submit_contract.get_my_task().call().await {
+                Ok((current_nonce, current_difficulty, active)) => {
+                    if !active {
+                        let error_msg = format!("任务 {} 已失效，跳过提交", submit_task_id);
+                        submit_app_state
+                            .lock()
+                            .unwrap()
+                            .add_log(error_msg, LogLevel::Warning);
+                        submit_app_state
+                            .lock()
+                            .unwrap()
+                            .update_task(submit_task_id, "任务已失效".to_string());
+                        continue;
+                    }
 
-                    // 等待交易确认
-                    match tx.await {
-                        Ok(Some(receipt)) => {
-                            // 检查交易状态
-                            if receipt.status.unwrap_or_default() == U64::from(1) {
-                                let success_msg =
-                                    format!("任务 {} 的解决方案已确认，交易成功", submit_task_id);
-                                submit_app_state
-                                    .lock()
-                                    .unwrap()
-                                    .add_log(success_msg, LogLevel::Success);
-
-                                // 更新任务状态为成功
-                                submit_app_state
-                                    .lock()
-                                    .unwrap()
-                                    .update_task(submit_task_id, "成功".to_string());
-
-                                // 在提交成功后更新钱包余额
-                                if let Err(e) =
-                                    update_wallet_balance(&submit_contract, &submit_app_state).await
-                                {
-                                    let error_msg = format!(
-                                        "任务 {} 提交后更新钱包余额失败: {}",
-                                        submit_task_id, e
-                                    );
-                                    submit_app_state
-                                        .lock()
-                                        .unwrap()
-                                        .add_log(error_msg, LogLevel::Warning);
-                                } else {
-                                    let update_msg = format!(
-                                        "任务 {} 提交成功后更新钱包余额成功",
-                                        submit_task_id
-                                    );
-                                    submit_app_state
-                                        .lock()
-                                        .unwrap()
-                                        .add_log(update_msg, LogLevel::Success);
-                                }
-                            } else {
+                    // 再次验证解决方案
+                    let address = submit_contract.client().address();
+                    match verify_solution_locally(
+                        current_nonce,
+                        address,
+                        solution,
+                        current_difficulty,
+                    ) {
+                        Ok(valid) => {
+                            if !valid {
                                 let error_msg = format!(
-                                    "任务 {} 的解决方案交易失败，请检查链上状态",
+                                    "任务 {} 解决方案不再满足难度要求，跳过提交",
                                     submit_task_id
                                 );
                                 submit_app_state
                                     .lock()
                                     .unwrap()
-                                    .add_log(error_msg, LogLevel::Error);
-
-                                // 更新任务状态为交易失败
+                                    .add_log(error_msg, LogLevel::Warning);
                                 submit_app_state
                                     .lock()
                                     .unwrap()
-                                    .update_task(submit_task_id, "交易失败".to_string());
+                                    .update_task(submit_task_id, "验证失败".to_string());
+                                continue;
                             }
                         }
-                        Ok(None) => {
-                            let error_msg =
-                                format!("任务 {} 的解决方案交易未能确认", submit_task_id);
-                            submit_app_state
-                                .lock()
-                                .unwrap()
-                                .add_log(error_msg, LogLevel::Error);
-
-                            // 更新任务状态为失败
-                            submit_app_state
-                                .lock()
-                                .unwrap()
-                                .update_task(submit_task_id, "确认失败".to_string());
-                        }
                         Err(e) => {
-                            let error_msg =
-                                format!("任务 {} 的解决方案确认失败: {}", submit_task_id, e);
+                            let error_msg = format!(
+                                "任务 {} 解决方案验证出错: {}, 跳过提交",
+                                submit_task_id, e
+                            );
                             submit_app_state
                                 .lock()
                                 .unwrap()
                                 .add_log(error_msg, LogLevel::Error);
-
-                            // 更新任务状态为失败
                             submit_app_state
                                 .lock()
                                 .unwrap()
-                                .update_task(submit_task_id, "确认失败".to_string());
+                                .update_task(submit_task_id, "验证错误".to_string());
+                            continue;
                         }
                     }
                 }
                 Err(e) => {
-                    let error_msg = format!("任务 {} 后台提交失败: {}", submit_task_id, e);
+                    let error_msg =
+                        format!("获取任务 {} 信息失败: {}, 尝试直接提交", submit_task_id, e);
+                    submit_app_state
+                        .lock()
+                        .unwrap()
+                        .add_log(error_msg, LogLevel::Warning);
+                }
+            }
+
+            // 执行提交
+            match submit_with_recovery(
+                &submit_contract,
+                solution,
+                submit_task_id,
+                &submit_app_state,
+            )
+            .await
+            {
+                Ok(Some(receipt)) => {
+                    // 检查交易状态
+                    if receipt.status.unwrap_or_default() == U64::from(1) {
+                        let success_msg =
+                            format!("任务 {} 的解决方案已确认，交易成功", submit_task_id);
+                        submit_app_state
+                            .lock()
+                            .unwrap()
+                            .add_log(success_msg, LogLevel::Success);
+
+                        // 更新任务状态为成功
+                        submit_app_state
+                            .lock()
+                            .unwrap()
+                            .update_task(submit_task_id, "成功".to_string());
+
+                        // 在提交成功后更新钱包余额
+                        if let Err(e) =
+                            update_wallet_balance(&submit_contract, &submit_app_state).await
+                        {
+                            let error_msg =
+                                format!("任务 {} 提交后更新钱包余额失败: {}", submit_task_id, e);
+                            submit_app_state
+                                .lock()
+                                .unwrap()
+                                .add_log(error_msg, LogLevel::Warning);
+                        } else {
+                            let update_msg =
+                                format!("任务 {} 提交成功后更新钱包余额成功", submit_task_id);
+                            submit_app_state
+                                .lock()
+                                .unwrap()
+                                .add_log(update_msg, LogLevel::Success);
+                        }
+                    } else {
+                        let error_msg =
+                            format!("任务 {} 的解决方案交易失败，请检查链上状态", submit_task_id);
+                        submit_app_state
+                            .lock()
+                            .unwrap()
+                            .add_log(error_msg, LogLevel::Error);
+
+                        // 更新任务状态为交易失败
+                        submit_app_state
+                            .lock()
+                            .unwrap()
+                            .update_task(submit_task_id, "交易失败".to_string());
+                    }
+                }
+                Ok(None) => {
+                    let error_msg = format!("任务 {} 的解决方案交易未能确认", submit_task_id);
                     submit_app_state
                         .lock()
                         .unwrap()
                         .add_log(error_msg, LogLevel::Error);
+
+                    // 更新任务状态为失败
+                    submit_app_state
+                        .lock()
+                        .unwrap()
+                        .update_task(submit_task_id, "确认失败".to_string());
+                }
+                Err(e) => {
+                    // 尝试解析错误消息，给用户更清晰的提示
+                    let error_msg = e.to_string();
+                    let parsed_msg = if error_msg.contains("underpriced") {
+                        format!(
+                            "任务 {} 后台提交失败: Gas价格过低，重试次数耗尽",
+                            submit_task_id
+                        )
+                    } else if error_msg.contains("nonce too low") {
+                        format!(
+                            "任务 {} 后台提交失败: nonce问题，重试次数耗尽",
+                            submit_task_id
+                        )
+                    } else if error_msg.contains("reverted") {
+                        format!(
+                            "任务 {} 后台提交失败: 合约拒绝交易，任务可能已过期或已被完成",
+                            submit_task_id
+                        )
+                    } else {
+                        format!("任务 {} 后台提交失败: {}", submit_task_id, e)
+                    };
+
+                    submit_app_state
+                        .lock()
+                        .unwrap()
+                        .add_log(parsed_msg, LogLevel::Error);
 
                     // 更新任务状态为提交失败，这样UI就不会继续显示它
                     submit_app_state
@@ -848,8 +912,83 @@ async fn request_and_calculate<M: Middleware + 'static>(
         .unwrap()
         .add_log(solution_msg, LogLevel::Success);
 
+    // 本地再次验证解决方案，确保满足难度要求
+    let verification_msg = format!("任务 {} - 验证解决方案是否满足难度要求", task_id);
+    app_state
+        .lock()
+        .unwrap()
+        .add_log(verification_msg, LogLevel::Info);
+
+    if !verify_solution_locally(nonce, address, solution, difficulty)? {
+        let error_msg = format!(
+            "任务 {} - 本地验证失败，解决方案不满足难度要求，放弃提交",
+            task_id
+        );
+        app_state
+            .lock()
+            .unwrap()
+            .add_log(error_msg, LogLevel::Error);
+
+        return Err(anyhow!("解决方案本地验证失败"));
+    }
+
+    // 验证任务是否仍然有效（防止其他矿工已经提交）
+    let (current_nonce, _, current_active) = contract.get_my_task().call().await?;
+    if !current_active || current_nonce != nonce {
+        let error_msg = format!("任务 {} - 任务已过期或已被他人提交，放弃提交", task_id);
+        app_state
+            .lock()
+            .unwrap()
+            .add_log(error_msg, LogLevel::Warning);
+
+        return Err(anyhow!("任务已失效"));
+    }
+
     // 返回解决方案供后续提交
     Ok(solution)
+}
+
+// 本地验证解决方案
+fn verify_solution_locally(
+    nonce: U256,
+    address: Address,
+    solution: U256,
+    difficulty: U256,
+) -> Result<bool> {
+    // 打包数据 - 与挖矿计算中相同的方法
+    let packed_data = solidity_pack_uint_address(nonce, address)?;
+    let mut input_data = Vec::with_capacity(packed_data.len() + 32);
+    input_data.extend_from_slice(&packed_data);
+
+    // 添加solution
+    let mut buffer = [0u8; 32];
+    solution.to_big_endian(&mut buffer);
+    input_data.extend_from_slice(&buffer);
+
+    // 计算哈希
+    let hash = keccak256(&input_data);
+    let hash_u256 = U256::from_big_endian(&hash);
+
+    // 计算 hash * difficulty
+    let hash_big = BigUint::from_bytes_be(&hash);
+    let difficulty_big = BigUint::from_bytes_be(&to_be_bytes_32(&difficulty));
+    let product = hash_big.clone() * difficulty_big.clone();
+
+    // 检查 hash * difficulty 是否 < 2^256
+    let is_valid_method1 = product < BigUint::from_bytes_be(&[0xFF; 32]);
+
+    // 第二种检验方法: 检查 hash < 2^256 / difficulty
+    let max_big = BigUint::from_bytes_be(&[0xFF; 32]);
+    let target = max_big / difficulty_big;
+    let is_valid_method2 = hash_big <= target;
+
+    // 两种方法应该得到相同结果，如果不同则打印警告
+    if is_valid_method1 != is_valid_method2 {
+        println!("警告：两种验证方法结果不一致！使用更严格的结果");
+    }
+
+    // 使用两种验证方法的结果的逻辑与，确保只有两种方法都成功才返回true
+    Ok(is_valid_method1 && is_valid_method2)
 }
 
 async fn await_solution(
@@ -900,6 +1039,8 @@ async fn mine_solution(
     let solution_found = Arc::new(AtomicBool::new(false));
     let solution_value = Arc::new(AtomicU64::new(0));
     let hashes_checked = Arc::new(AtomicUsize::new(0));
+    let error_occurred = Arc::new(AtomicBool::new(false));
+    let error_message = Arc::new(Mutex::new(String::new()));
 
     // 启动哈希率更新任务
     let update_task = {
@@ -907,12 +1048,16 @@ async fn mine_solution(
         let app_state = app_state.clone();
         let solution_found = solution_found.clone();
         let stop_flag = stop_flag.clone();
+        let error_occurred = error_occurred.clone();
 
         tokio::spawn(async move {
             let mut last_check = Instant::now();
             let mut last_hashes = 0;
 
-            while !solution_found.load(Ordering::Relaxed) && !stop_flag.load(Ordering::Relaxed) {
+            while !solution_found.load(Ordering::Relaxed)
+                && !stop_flag.load(Ordering::Relaxed)
+                && !error_occurred.load(Ordering::Relaxed)
+            {
                 sleep(Duration::from_secs(1)).await;
 
                 let current_hashes = hashes_checked.load(Ordering::Relaxed);
@@ -960,10 +1105,12 @@ async fn mine_solution(
         let solution_found = solution_found.clone();
         let solution_value = solution_value.clone();
         let hashes_checked = hashes_checked.clone();
+        let error_occurred = error_occurred.clone();
+        let error_message = error_message.clone();
 
         // 拷贝预计算的值
-        let difficulty_bytes = difficulty_bytes.clone();
-        let max_bytes = max_bytes.clone();
+        let difficulty_bytes = difficulty_bytes;
+        let max_bytes = max_bytes;
 
         // 启动计算线程
         let handle = std::thread::spawn(move || {
@@ -974,57 +1121,76 @@ async fn mine_solution(
             // 预先计算难度比较值 - 只计算一次
             let difficulty_big = BigUint::from_bytes_be(&difficulty_bytes);
             let max_big = BigUint::from_bytes_be(&max_bytes);
-            let target_value = &max_big / &difficulty_big; // 使用引用避免移动所有权
 
-            let mut counter = 0;
-            const REPORT_INTERVAL: usize = 10000; // 增大报告间隔减少原子操作频率
+            // 使用引用避免移动所有权
+            match &max_big / &difficulty_big {
+                target_value => {
+                    let mut counter = 0;
+                    const REPORT_INTERVAL: usize = 10000; // 增大报告间隔减少原子操作频率
 
-            // 预分配缓冲区减少内存分配
-            let mut input_data = Vec::with_capacity(packed_data.len() + 32);
-            input_data.extend_from_slice(&packed_data);
-            input_data.resize(packed_data.len() + 32, 0); // 预留32字节用于solution
+                    // 预分配缓冲区减少内存分配
+                    let mut input_data = Vec::with_capacity(packed_data.len() + 32);
+                    input_data.extend_from_slice(&packed_data);
+                    input_data.resize(packed_data.len() + 32, 0); // 预留32字节用于solution
 
-            // 更高效地使用buffer
-            let data_prefix_len = packed_data.len();
+                    // 更高效地使用buffer
+                    let data_prefix_len = packed_data.len();
 
-            while current <= end_big && !stop_flag.load(Ordering::Relaxed) {
-                // 将当前值转换为bytes
-                let current_bytes = current.to_bytes_be();
-                let current_u256 = U256::from_big_endian(&pad_to_32(&current_bytes));
+                    while current <= end_big
+                        && !stop_flag.load(Ordering::Relaxed)
+                        && !error_occurred.load(Ordering::Relaxed)
+                    {
+                        // 将当前值转换为bytes
+                        let current_bytes = current.to_bytes_be();
+                        let current_u256 = match U256::from_big_endian(&pad_to_32(&current_bytes)) {
+                            value => value,
+                        };
 
-                // 直接在预分配缓冲区上操作，避免多次克隆和分配
-                current_u256.to_big_endian(&mut input_data[data_prefix_len..]);
+                        // 直接在预分配缓冲区上操作，避免多次克隆和分配
+                        current_u256.to_big_endian(&mut input_data[data_prefix_len..]);
 
-                // 计算哈希
-                let hash = keccak256(&input_data);
-                let hash_big = BigUint::from_bytes_be(&hash);
+                        // 计算哈希
+                        let hash = keccak256(&input_data);
 
-                // 检查是否满足难度要求 - 使用预计算的目标值，避免在循环中重复计算除法
-                if hash_big <= target_value {
-                    // 找到解决方案
-                    solution_value.store(current_u256.as_u64(), Ordering::Relaxed);
-                    solution_found.store(true, Ordering::Relaxed);
-                    stop_flag.store(true, Ordering::Relaxed);
-                    break;
-                }
+                        // 处理哈希转换，避免可能的错误
+                        let hash_big = match BigUint::from_bytes_be(&hash) {
+                            value => value,
+                        };
 
-                // 更新计数器和检查的哈希数
-                counter += 1;
-                if counter % REPORT_INTERVAL == 0 {
-                    hashes_checked.fetch_add(REPORT_INTERVAL, Ordering::Relaxed);
+                        // 检查是否满足难度要求 - 使用预计算的目标值，避免在循环中重复计算除法
+                        if hash_big <= target_value {
+                            // 找到解决方案
+                            match current_u256.as_u64() {
+                                value => {
+                                    solution_value.store(value, Ordering::Relaxed);
+                                    solution_found.store(true, Ordering::Relaxed);
+                                    stop_flag.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                        }
 
-                    // 定期检查停止标志，减少原子操作频率
-                    if stop_flag.load(Ordering::Relaxed) {
-                        break;
+                        // 更新计数器和检查的哈希数
+                        counter += 1;
+                        if counter % REPORT_INTERVAL == 0 {
+                            hashes_checked.fetch_add(REPORT_INTERVAL, Ordering::Relaxed);
+
+                            // 定期检查停止标志，减少原子操作频率
+                            if stop_flag.load(Ordering::Relaxed)
+                                || error_occurred.load(Ordering::Relaxed)
+                            {
+                                break;
+                            }
+                        }
+
+                        // 递增当前值
+                        current += 1u32;
                     }
+
+                    // 添加剩余的计数
+                    hashes_checked.fetch_add(counter % REPORT_INTERVAL, Ordering::Relaxed);
                 }
-
-                // 递增当前值
-                current += 1u32;
             }
-
-            // 添加剩余的计数
-            hashes_checked.fetch_add(counter % REPORT_INTERVAL, Ordering::Relaxed);
 
             Ok::<(), anyhow::Error>(())
         });
@@ -1039,6 +1205,14 @@ async fn mine_solution(
             // 停止所有线程
             stop_flag.store(true, Ordering::Relaxed);
             break;
+        }
+
+        // 检查是否有错误发生
+        if error_occurred.load(Ordering::Relaxed) {
+            // 停止所有线程
+            stop_flag.store(true, Ordering::Relaxed);
+            let error_text = error_message.lock().unwrap().clone();
+            return Err(anyhow!("计算过程发生错误: {}", error_text));
         }
 
         // 检查是否所有线程都已完成
@@ -1057,7 +1231,14 @@ async fn mine_solution(
     // 等待所有线程完成
     for handle in handles {
         if let Err(e) = handle.join() {
-            eprintln!("计算线程异常退出: {:?}", e);
+            let error_msg = format!("计算线程异常退出: {:?}", e);
+            app_state
+                .lock()
+                .unwrap()
+                .add_log(error_msg.clone(), LogLevel::Error);
+
+            error_occurred.store(true, Ordering::Relaxed);
+            *error_message.lock().unwrap() = error_msg;
         }
     }
 
@@ -1065,6 +1246,12 @@ async fn mine_solution(
     if solution_found.load(Ordering::Relaxed) {
         let solution = U256::from(solution_value.load(Ordering::Relaxed));
         return Ok(solution);
+    }
+
+    // 检查是否有错误发生
+    if error_occurred.load(Ordering::Relaxed) {
+        let error_text = error_message.lock().unwrap().clone();
+        return Err(anyhow!("计算过程发生错误: {}", error_text));
     }
 
     Err(anyhow!("未能找到解决方案"))
@@ -1278,4 +1465,127 @@ fn configure_mining_parameters(app_state: &Arc<Mutex<App>>) {
     );
     println!("{}", config_msg.green());
     app.add_log(config_msg, LogLevel::Info);
+}
+
+// 执行提交，带有nonce恢复和gas调整机制
+async fn submit_with_recovery<M: Middleware + 'static>(
+    contract: &MiningContract<SignerMiddleware<M, LocalWallet>>,
+    solution: U256,
+    task_id: usize,
+    app_state: &Arc<Mutex<App>>,
+) -> Result<Option<TransactionReceipt>> {
+    let mut retry_count = 0;
+    const MAX_RETRIES: usize = 3;
+
+    // 获取当前gas价格，并加一点buffer
+    let mut gas_price = contract.client().get_gas_price().await?;
+    let mut gas_price_with_buffer = gas_price * 110 / 100; // 增加10%
+
+    // 获取当前nonce
+    let address = contract.client().address();
+    let mut current_nonce = contract
+        .client()
+        .get_transaction_count(address, None)
+        .await?;
+
+    // 尝试提交，如果失败则重试
+    while retry_count < MAX_RETRIES {
+        // 每次循环都创建新的交易实例
+        let mut tx = contract.submit_mining_result(solution);
+
+        // 设置当前的gas价格和nonce
+        tx.tx.set_gas_price(gas_price_with_buffer);
+        tx.tx.set_nonce(current_nonce);
+
+        let result = tx.send().await;
+
+        match result {
+            Ok(pending_tx) => {
+                // 交易发送成功，等待确认
+                let log_msg = format!("任务 {} 解决方案已提交，等待确认", task_id);
+                app_state.lock().unwrap().add_log(log_msg, LogLevel::Info);
+
+                // 等待交易确认
+                return match pending_tx.await {
+                    Ok(receipt) => Ok(receipt),
+                    Err(e) => {
+                        let error_msg = format!("任务 {} 交易确认失败: {}", task_id, e);
+                        app_state
+                            .lock()
+                            .unwrap()
+                            .add_log(error_msg, LogLevel::Error);
+                        Err(anyhow!("交易确认失败"))
+                    }
+                };
+            }
+            Err(e) => {
+                let error_text = e.to_string();
+                if error_text.contains("nonce too low") || error_text.contains("already known") {
+                    // nonce问题，获取正确的nonce
+                    match contract.client().get_transaction_count(address, None).await {
+                        Ok(new_nonce) => {
+                            let nonce_msg = format!(
+                                "任务 {} nonce过低，更新nonce: {:?} -> {:?}",
+                                task_id, current_nonce, new_nonce
+                            );
+                            app_state
+                                .lock()
+                                .unwrap()
+                                .add_log(nonce_msg, LogLevel::Warning);
+
+                            // 更新nonce供下次循环使用
+                            current_nonce = new_nonce;
+                        }
+                        Err(nonce_err) => {
+                            let error_msg =
+                                format!("任务 {} 无法获取新nonce: {}", task_id, nonce_err);
+                            app_state
+                                .lock()
+                                .unwrap()
+                                .add_log(error_msg, LogLevel::Error);
+                            return Err(anyhow!(nonce_err));
+                        }
+                    }
+                } else if error_text.contains("underpriced") {
+                    // gas价格过低，增加gas价格
+                    let new_gas_price =
+                        gas_price_with_buffer * (retry_count as u64 + 2) / (retry_count as u64 + 1);
+                    let gas_msg = format!(
+                        "任务 {} gas价格过低，从 {:?} 增加到 {:?}",
+                        task_id, gas_price_with_buffer, new_gas_price
+                    );
+                    app_state
+                        .lock()
+                        .unwrap()
+                        .add_log(gas_msg, LogLevel::Warning);
+
+                    // 更新gas价格供下次循环使用
+                    gas_price_with_buffer = new_gas_price;
+                } else {
+                    // 其他错误，不重试
+                    let error_msg = format!("任务 {} 提交失败: {}", task_id, e);
+                    app_state
+                        .lock()
+                        .unwrap()
+                        .add_log(error_msg, LogLevel::Error);
+                    return Err(anyhow!(e));
+                }
+            }
+        }
+
+        retry_count += 1;
+        let retry_msg = format!(
+            "任务 {} 重试提交 ({}/{})",
+            task_id, retry_count, MAX_RETRIES
+        );
+        app_state
+            .lock()
+            .unwrap()
+            .add_log(retry_msg, LogLevel::Warning);
+
+        // 等待一会儿再重试
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    Err(anyhow!("达到最大重试次数，提交失败"))
 }

@@ -28,6 +28,7 @@ num_cpus = "1.16"
 ratatui = "0.25.0"
 crossterm = "0.27.0"
 chrono = "0.4"
+serde = "1.0.219"
 
 [profile.release]
 opt-level = 3
