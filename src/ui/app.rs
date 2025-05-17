@@ -275,7 +275,7 @@ impl App {
     // 滚动日志
     pub fn scroll_logs(&mut self, delta: isize) {
         if delta < 0 && self.log_scroll > 0 {
-            self.log_scroll = self.log_scroll.saturating_sub(delta.abs() as usize);
+            self.log_scroll = self.log_scroll.saturating_sub(delta.unsigned_abs());
         } else if delta > 0 {
             self.log_scroll = self.log_scroll.saturating_add(delta as usize);
         }

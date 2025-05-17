@@ -21,14 +21,14 @@ pub fn render<B: Backend>(f: &mut Frame, app: &App) {
         .split(f.size());
 
     // 渲染上半部分信息区域
-    render_info_area::<B>(f, app, chunks[0]);
+    render_info_area(f, app, chunks[0]);
 
     // 渲染下半部分日志区域
-    render_logs_area::<B>(f, app, chunks[1]);
+    render_logs_area(f, app, chunks[1]);
 }
 
 // 渲染信息区域
-fn render_info_area<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
+fn render_info_area(f: &mut Frame, app: &App, area: Rect) {
     // 将信息区域分为左右两部分
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -39,7 +39,7 @@ fn render_info_area<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     // 渲染左侧钱包、合约和配置信息
-    render_left_panel::<B>(f, app, chunks[0]);
+    render_left_panel(f, app, chunks[0]);
 
     // 将右侧区域再分为上下两部分
     let right_chunks = Layout::default()
@@ -51,14 +51,14 @@ fn render_info_area<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
         .split(chunks[1]);
 
     // 渲染右上方挖矿摘要信息
-    render_mining_summary::<B>(f, app, right_chunks[0]);
+    render_mining_summary(f, app, right_chunks[0]);
 
     // 渲染右下方任务列表
-    render_task_list::<B>(f, app, right_chunks[1]);
+    render_task_list(f, app, right_chunks[1]);
 }
 
 // 渲染左侧面板（钱包、合约、配置信息）
-fn render_left_panel<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
+fn render_left_panel(f: &mut Frame, app: &App, area: Rect) {
     // 分割区域为上中下三部分
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -70,17 +70,17 @@ fn render_left_panel<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     // 渲染钱包信息
-    render_wallet_info::<B>(f, app, chunks[0]);
+    render_wallet_info(f, app, chunks[0]);
 
     // 渲染合约信息
-    render_contract_info::<B>(f, app, chunks[1]);
+    render_contract_info(f, app, chunks[1]);
 
     // 渲染配置信息
-    render_config_info::<B>(f, app, chunks[2]);
+    render_config_info(f, app, chunks[2]);
 }
 
 // 渲染钱包信息
-fn render_wallet_info<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
+fn render_wallet_info(f: &mut Frame, app: &App, area: Rect) {
     // 钱包信息
     let wallet_info = vec![
         Line::from(vec![
@@ -113,7 +113,7 @@ fn render_wallet_info<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // 渲染合约信息
-fn render_contract_info<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
+fn render_contract_info(f: &mut Frame, app: &App, area: Rect) {
     // 合约信息
     let contract_info = vec![
         Line::from(vec![
@@ -141,7 +141,7 @@ fn render_contract_info<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // 渲染配置信息
-fn render_config_info<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
+fn render_config_info(f: &mut Frame, app: &App, area: Rect) {
     // 配置信息
     let config_info = vec![
         Line::from(vec![
@@ -186,7 +186,7 @@ fn render_config_info<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // 渲染挖矿摘要信息
-fn render_mining_summary<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
+fn render_mining_summary(f: &mut Frame, app: &App, area: Rect) {
     // 格式化运行时间
     let uptime_str = format_duration(Duration::from_secs(app.mining_status.uptime));
 
@@ -256,7 +256,7 @@ fn render_mining_summary<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // 渲染任务列表
-fn render_task_list<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
+fn render_task_list(f: &mut Frame, app: &App, area: Rect) {
     // 表头
     let header_cells = ["ID", "Nonce", "难度", "状态", "哈希率"].iter().map(|h| {
         Span::styled(
@@ -404,7 +404,7 @@ fn render_task_list<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // 渲染日志区域
-fn render_logs_area<B: Backend>(f: &mut Frame, app: &App, area: Rect) {
+fn render_logs_area(f: &mut Frame, app: &App, area: Rect) {
     // 日志块
     let log_block = Block::default().borders(Borders::ALL).title("日志信息");
     f.render_widget(log_block.clone(), area);

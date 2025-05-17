@@ -54,9 +54,9 @@ pub async fn test_all_rpc_nodes(app_state: &Arc<Mutex<App>>) -> Result<HashMap<&
     // 等待所有任务完成
     let results = futures::future::join_all(tasks).await;
 
-    // 处理结果
-    for result in results {
-        if let Ok(Some((rpc, response_time))) = result {
+    // 处理结果，使用 flatten 优化代码结构
+    for result in results.into_iter().flatten() {
+        if let Some((rpc, response_time)) = result {
             response_times.insert(rpc, response_time);
 
             // 更新应用状态中的响应时间

@@ -42,9 +42,8 @@ impl EventHandler {
                 if event::poll(timeout).expect("事件轮询出错") {
                     if let CrosstermEvent::Key(key) = event::read().expect("读取事件出错") {
                         // 处理退出快捷键 (Ctrl+C 或 Ctrl+Q 或 'q')
-                        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL
-                            || key.code == KeyCode::Char('q')
-                                && key.modifiers == KeyModifiers::CONTROL
+                        if (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('q'))
+                            && key.modifiers == KeyModifiers::CONTROL
                             || key.code == KeyCode::Char('q')
                         {
                             tx.send(Event::Input(())).expect("无法发送输入事件");

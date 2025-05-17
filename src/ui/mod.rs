@@ -20,12 +20,13 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+// 定义TUI相关类型
+pub type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
+pub type EventSender = mpsc::Sender<Event<()>>;
+pub type EventReceiver = mpsc::Receiver<Event<()>>;
+
 // TUI初始化函数
-pub fn init_tui() -> Result<(
-    Terminal<CrosstermBackend<Stdout>>,
-    mpsc::Sender<Event<()>>,
-    mpsc::Receiver<Event<()>>,
-)> {
+pub fn init_tui() -> Result<(TuiTerminal, EventSender, EventReceiver)> {
     // 设置终端
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -35,7 +36,7 @@ pub fn init_tui() -> Result<(
 
     // 设置事件处理
     let (tx, rx) = mpsc::channel(100);
-    let event_handler = EventHandler::new(tick_rate);
+    let event_handler = EventHandler::new(TICK_RATE);
     let tx_clone = tx.clone();
     tokio::spawn(async move {
         event_handler.start(tx_clone).await;
@@ -45,7 +46,7 @@ pub fn init_tui() -> Result<(
 }
 
 // TUI销毁函数
-pub fn destroy_tui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+pub fn destroy_tui(terminal: &mut TuiTerminal) -> Result<()> {
     // 恢复终端
     disable_raw_mode()?;
     execute!(
@@ -63,4 +64,4 @@ pub fn create_app() -> Arc<Mutex<App>> {
 }
 
 // 定义tick_rate常量
-const tick_rate: Duration = Duration::from_millis(200);
+const TICK_RATE: Duration = Duration::from_millis(200);

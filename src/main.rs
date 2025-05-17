@@ -1,33 +1,45 @@
 use anyhow::{anyhow, Result};
-use colored::*;
-use dialoguer::{Input, Select};
+use colored::Colorize;
+use console::Term;
+use dialoguer::{theme::ColorfulTheme, Input, Select};
 use ethers::{
     abi::Token,
+    middleware::SignerMiddleware,
     prelude::*,
-    providers::{Http, Provider},
+    providers::{Http, JsonRpcClient, Middleware, Provider},
+    signers::{coins_bip39::English, LocalWallet, MnemonicBuilder, Signer},
+    types::{Address, BlockNumber, H160, H256, U256},
     utils::keccak256,
 };
-use futures::future::join_all;
-use futures_util::future::FutureExt;
+use lazy_static::lazy_static;
 use num_bigint::BigUint;
-use ratatui::backend::CrosstermBackend;
+use num_traits::Num;
+use rand::Rng;
 use std::{
-    convert::TryFrom,
+    collections::HashMap,
+    fmt,
+    io::{self, stdout, Stdout},
+    path::Path,
+    str::{from_utf8, FromStr},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
+    thread,
     time::{Duration, Instant},
 };
-use tokio::time::sleep;
+use tokio::{sync::mpsc, time::sleep};
 
 mod contract;
 mod rpc;
 mod ui;
 
 use contract::MiningContract;
-use rpc::{find_fastest_rpc, select_rpc_node, RPC_OPTIONS};
-use ui::{create_app, destroy_tui, init_tui, render, App, AppState, Event, LogLevel};
+use rpc::select_rpc_node;
+use ui::{
+    app::{App, AppConfig, LogLevel, TaskInfo},
+    event::{Event, EventHandler},
+};
 
 // 定义常量
 const CONTRACT_ADDRESS: &str = "0x51e0ab7f7db4a2bf4500dfa59f7a4957afc8c02e";
@@ -41,7 +53,7 @@ const CHAIN_ID: u64 = 114514; // 修正为正确的链ID
 #[tokio::main]
 async fn main() -> Result<()> {
     // 初始化应用状态
-    let app_state = create_app();
+    let app_state = ui::create_app();
 
     print_welcome_message();
 
@@ -189,7 +201,7 @@ async fn main() -> Result<()> {
         .add_log(mining_msg.to_string(), LogLevel::Success);
 
     // 初始化TUI
-    let (mut terminal, _tx, mut rx) = init_tui()?;
+    let (mut terminal, _tx, mut rx) = ui::init_tui()?;
 
     // 在单独的线程中运行挖矿
     let mining_app_state = app_state.clone();
@@ -208,14 +220,17 @@ async fn main() -> Result<()> {
     loop {
         // 渲染TUI
         terminal.draw(|f| {
-            render::<CrosstermBackend<std::io::Stdout>>(f, &app_state.lock().unwrap());
+            ui::ui::render::<ratatui::backend::CrosstermBackend<std::io::Stdout>>(
+                f,
+                &app_state.lock().unwrap(),
+            );
         })?;
 
         // 处理事件
         match rx.recv().await {
             Some(Event::Input(_)) => {
                 // 用户按下q或Ctrl+C等退出键
-                app_state.lock().unwrap().state = AppState::Exiting;
+                app_state.lock().unwrap().state = ui::app::AppState::Exiting;
                 break;
             }
             Some(Event::Tick) => {
@@ -225,13 +240,13 @@ async fn main() -> Result<()> {
         }
 
         // 检查是否应该退出
-        if app_state.lock().unwrap().state == AppState::Exiting {
+        if app_state.lock().unwrap().state == ui::app::AppState::Exiting {
             break;
         }
     }
 
     // 清理并退出
-    destroy_tui(&mut terminal)?;
+    ui::destroy_tui(&mut terminal)?;
 
     println!("程序已退出 / Program exited.");
     Ok(())
@@ -458,9 +473,9 @@ async fn start_mining_loop<M: Middleware + 'static>(
     contract: MiningContract<SignerMiddleware<M, LocalWallet>>,
     app_state: Arc<Mutex<App>>,
 ) -> Result<()> {
-    // 获取任务和线程配置
+    // 获取用户配置的任务数和线程数
     let task_count = app_state.lock().unwrap().config.task_count;
-    let thread_count = app_state.lock().unwrap().config.thread_count;
+    let _thread_count = app_state.lock().unwrap().config.thread_count;
 
     // 更新应用状态中的任务数量
     app_state.lock().unwrap().mining_status.total_tasks = task_count;
@@ -640,7 +655,7 @@ async fn start_mining_loop<M: Middleware + 'static>(
         let task_app_state = app_state.clone();
         let task_submit_tx = submit_tx.clone();
 
-        let task_name = format!("挖矿任务-{}", i);
+        let _task_name = format!("挖矿任务-{}", i);
         let task_info = format!("启动并行挖矿任务 #{}", i);
         task_app_state
             .lock()
@@ -923,8 +938,13 @@ async fn mine_solution(
     let batch_size = u64::MAX / thread_count as u64;
     let mut handles = Vec::with_capacity(thread_count);
 
-    // 将地址和nonce打包
+    // 预先计算一些常量值
+    // 将地址和nonce打包 - 只需计算一次
     let packed_data = solidity_pack_uint_address(nonce, address)?;
+
+    // 预先计算难度相关值
+    let difficulty_bytes = to_be_bytes_32(&difficulty);
+    let max_bytes = [0xFF; 32];
 
     // 启动多个计算线程
     for i in 0..thread_count {
@@ -940,36 +960,47 @@ async fn mine_solution(
         let solution_found = solution_found.clone();
         let solution_value = solution_value.clone();
         let hashes_checked = hashes_checked.clone();
-        let difficulty = difficulty;
+
+        // 拷贝预计算的值
+        let difficulty_bytes = difficulty_bytes.clone();
+        let max_bytes = max_bytes.clone();
 
         // 启动计算线程
         let handle = std::thread::spawn(move || {
-            // 使用BigUint进行范围计算 - 修复U256没有to_be_bytes方法的问题
+            // 使用BigUint进行范围计算
             let mut current = BigUint::from_bytes_be(&to_be_bytes_32(&start));
             let end_big = BigUint::from_bytes_be(&to_be_bytes_32(&end));
-            let difficulty_big = BigUint::from_bytes_be(&to_be_bytes_32(&difficulty));
-            // 创建一个最大值的BigUint，避免在循环中移动
-            let max_big = BigUint::from_bytes_be(&[0xFF; 32]);
+
+            // 预先计算难度比较值 - 只计算一次
+            let difficulty_big = BigUint::from_bytes_be(&difficulty_bytes);
+            let max_big = BigUint::from_bytes_be(&max_bytes);
+            let target_value = &max_big / &difficulty_big; // 使用引用避免移动所有权
 
             let mut counter = 0;
-            const REPORT_INTERVAL: usize = 1000;
+            const REPORT_INTERVAL: usize = 10000; // 增大报告间隔减少原子操作频率
+
+            // 预分配缓冲区减少内存分配
+            let mut input_data = Vec::with_capacity(packed_data.len() + 32);
+            input_data.extend_from_slice(&packed_data);
+            input_data.resize(packed_data.len() + 32, 0); // 预留32字节用于solution
+
+            // 更高效地使用buffer
+            let data_prefix_len = packed_data.len();
 
             while current <= end_big && !stop_flag.load(Ordering::Relaxed) {
                 // 将当前值转换为bytes
                 let current_bytes = current.to_bytes_be();
                 let current_u256 = U256::from_big_endian(&pad_to_32(&current_bytes));
 
-                // 打包数据
-                let mut input_data = packed_data.clone();
-                solidity_pack_bytes_uint_into(&[], current_u256, &mut input_data)?;
+                // 直接在预分配缓冲区上操作，避免多次克隆和分配
+                current_u256.to_big_endian(&mut input_data[data_prefix_len..]);
 
                 // 计算哈希
-                let hash = keccak256(input_data);
-                let _hash_u256 = U256::from_big_endian(&hash);
+                let hash = keccak256(&input_data);
                 let hash_big = BigUint::from_bytes_be(&hash);
 
-                // 检查是否满足难度要求 - 使用克隆避免移动问题
-                if hash_big <= max_big.clone() / difficulty_big.clone() {
+                // 检查是否满足难度要求 - 使用预计算的目标值，避免在循环中重复计算除法
+                if hash_big <= target_value {
                     // 找到解决方案
                     solution_value.store(current_u256.as_u64(), Ordering::Relaxed);
                     solution_found.store(true, Ordering::Relaxed);
@@ -981,6 +1012,11 @@ async fn mine_solution(
                 counter += 1;
                 if counter % REPORT_INTERVAL == 0 {
                     hashes_checked.fetch_add(REPORT_INTERVAL, Ordering::Relaxed);
+
+                    // 定期检查停止标志，减少原子操作频率
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
                 }
 
                 // 递增当前值
@@ -1175,7 +1211,7 @@ fn configure_mining_parameters(app_state: &Arc<Mutex<App>>) {
             if *input > 0 && *input <= cpu_count * 2 {
                 Ok(())
             } else {
-                Err(&"线程数必须大于0且不超过CPU核心数的两倍 / Thread count must be > 0 and <= 2x CPU cores")
+                Err("线程数必须大于0且不超过CPU核心数的两倍 / Thread count must be > 0 and <= 2x CPU cores")
             }
         })
         .interact()
@@ -1189,7 +1225,7 @@ fn configure_mining_parameters(app_state: &Arc<Mutex<App>>) {
             if *input > 0 && *input <= 10 {
                 Ok(())
             } else {
-                Err(&"任务数必须大于0且不超过10 / Task count must be > 0 and <= 10")
+                Err("任务数必须大于0且不超过10 / Task count must be > 0 and <= 10")
             }
         })
         .interact()
