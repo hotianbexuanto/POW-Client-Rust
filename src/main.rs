@@ -1370,6 +1370,52 @@ fn to_be_bytes_32(value: &U256) -> [u8; 32] {
     bytes
 }
 
+// 计算预期挖矿收益率
+fn calculate_mining_profitability(
+    gas_price: U256,
+    estimated_gas: U256,
+    reward_amount: U256,
+) -> Result<(bool, f64)> {
+    // 计算交易成本
+    let transaction_cost = gas_price * estimated_gas;
+
+    // 将U256转换为f64以便进行比率计算
+    let cost_eth = ethers::utils::format_ether(transaction_cost)
+        .parse::<f64>()
+        .unwrap_or(0.0);
+    let reward_eth = ethers::utils::format_ether(reward_amount)
+        .parse::<f64>()
+        .unwrap_or(0.0);
+
+    if cost_eth >= reward_eth {
+        // 成本大于或等于奖励，无利可图
+        return Ok((false, 0.0));
+    }
+
+    // 计算利润率: (reward - cost) / reward * 100%
+    let profit_percentage = (reward_eth - cost_eth) / reward_eth * 100.0;
+
+    // 如果利润率低于10%，认为收益太低
+    let is_profitable = profit_percentage > 10.0;
+
+    Ok((is_profitable, profit_percentage))
+}
+
+// 根据网络负载调整Gas价格
+fn adjust_gas_price_by_network_load(
+    base_gas_price: U256,
+    network_load: f64, // 0.0-1.0 代表网络负载百分比
+) -> U256 {
+    // 计算动态增幅，负载越高增幅越大，最高增幅为50%
+    let load_factor = 1.0 + (network_load * 0.5);
+
+    // 将f64转换回U256
+    let multiplier = (load_factor * 100.0) as u64;
+    let adjusted_gas = base_gas_price * multiplier / 100;
+
+    adjusted_gas
+}
+
 // 优化的内存复用版本solidity_pack_bytes_uint
 fn solidity_pack_bytes_uint_into(bytes: &[u8], num: U256, output: &mut Vec<u8>) -> Result<()> {
     // 确保有足够的容量
@@ -1575,9 +1621,91 @@ async fn submit_with_recovery<M: Middleware + 'static>(
     let mut retry_count = 0;
     const MAX_RETRIES: usize = 3;
 
-    // 获取当前gas价格，并加一点buffer
+    // 获取当前gas价格，并根据网络情况智能调整
     let mut gas_price = contract.client().get_gas_price().await?;
-    let mut gas_price_with_buffer = gas_price * 110 / 100; // 增加10%
+
+    // 估算网络负载 (查询最近区块的gasUsed/gasLimit比率)
+    let mut network_load = 0.5; // 默认假设中等负载
+
+    // 尝试获取网络负载信息
+    match contract.client().get_block(BlockNumber::Latest).await {
+        Ok(Some(block)) => {
+            // gas_used和gas_limit已经是U256类型而不是Option<U256>
+            let gas_used = block.gas_used;
+            let gas_limit = block.gas_limit;
+            if gas_limit.is_zero() {
+                // 防止除以零
+                network_load = 0.5; // 使用默认值
+            } else {
+                network_load = gas_used.as_u128() as f64 / gas_limit.as_u128() as f64;
+                let load_info = format!(
+                    "任务 {} - 当前网络负载: {:.1}%",
+                    task_id,
+                    network_load * 100.0
+                );
+                app_state.lock().unwrap().add_log(load_info, LogLevel::Info);
+            }
+        }
+        _ => {
+            app_state.lock().unwrap().add_log(
+                format!("任务 {} - 无法获取网络负载信息，使用默认值", task_id),
+                LogLevel::Warning,
+            );
+        }
+    }
+
+    // 根据网络负载调整初始buffer
+    let initial_buffer_percent = if network_load > 0.8 {
+        115 // 高负载时提高到15%
+    } else if network_load > 0.5 {
+        112 // 中高负载时提高到12%
+    } else {
+        110 // 正常负载提高10%
+    };
+
+    let mut gas_price_with_buffer = gas_price * initial_buffer_percent / 100;
+
+    // 估算交易所需gas量和收益，检查是否值得挖矿
+    let estimated_gas = U256::from(150_000); // 估计POW提交大约需要约15万gas
+    let mining_reward = ethers::utils::parse_ether(3.0)?; // 每次挖矿奖励3 MAG
+
+    // 计算预期收益率
+    if let Ok((is_profitable, profit_percentage)) =
+        calculate_mining_profitability(gas_price_with_buffer, estimated_gas, mining_reward)
+    {
+        if !is_profitable {
+            let warning_msg = format!(
+                "任务 {} - 警告：当前Gas价格下挖矿可能无利可图，收益率仅为{:.1}%",
+                task_id, profit_percentage
+            );
+            app_state
+                .lock()
+                .unwrap()
+                .add_log(warning_msg, LogLevel::Warning);
+        } else {
+            let profit_msg = format!(
+                "任务 {} - 当前Gas价格下预计收益率: {:.1}%",
+                task_id, profit_percentage
+            );
+            app_state
+                .lock()
+                .unwrap()
+                .add_log(profit_msg, LogLevel::Info);
+        }
+    }
+
+    // 记录基础gas价格信息
+    let base_gas_info = format!(
+        "任务 {} - 基础Gas价格: {} Gwei, 初始调整后: {} Gwei (上浮{}%)",
+        task_id,
+        gas_price.as_u64() / 1_000_000_000,
+        gas_price_with_buffer.as_u64() / 1_000_000_000,
+        initial_buffer_percent - 100
+    );
+    app_state
+        .lock()
+        .unwrap()
+        .add_log(base_gas_info, LogLevel::Info);
 
     // 获取当前nonce
     let address = contract.client().address();
@@ -1600,21 +1728,54 @@ async fn submit_with_recovery<M: Middleware + 'static>(
         match result {
             Ok(pending_tx) => {
                 // 交易发送成功，等待确认
-                let log_msg = format!("任务 {} 解决方案已提交，等待确认", task_id);
+                let tx_hash = format!("{:?}", pending_tx.tx_hash());
+                let log_msg = format!(
+                    "任务 {} 解决方案已提交，交易哈希: {} ，等待确认",
+                    task_id, tx_hash
+                );
                 app_state.lock().unwrap().add_log(log_msg, LogLevel::Info);
 
                 // 等待交易确认
-                return match pending_tx.await {
-                    Ok(receipt) => Ok(receipt),
+                match pending_tx.await {
+                    Ok(receipt_option) => {
+                        if let Some(receipt) = receipt_option.as_ref() {
+                            // 计算实际gas使用和成本
+                            if let Some(gas_used) = receipt.gas_used {
+                                let actual_gas_cost = gas_used * gas_price_with_buffer;
+                                let gas_cost_eth = ethers::utils::format_ether(actual_gas_cost);
+                                let reward_eth = "3.0"; // 固定3 MAG奖励
+                                let profit = 3.0 - gas_cost_eth.parse::<f64>().unwrap_or(0.0);
+                                let profit_percent = profit / 3.0 * 100.0;
+
+                                let success_msg = format!(
+                                    "任务 {} 挖矿成功！使用Gas: {}, 成本: {} MAG, 利润: {:.4} MAG ({:.1}%)",
+                                    task_id, gas_used, gas_cost_eth, profit, profit_percent
+                                );
+                                app_state
+                                    .lock()
+                                    .unwrap()
+                                    .add_log(success_msg, LogLevel::Success);
+                            } else {
+                                let success_basic =
+                                    format!("任务 {} 挖矿成功！交易已确认", task_id);
+                                app_state
+                                    .lock()
+                                    .unwrap()
+                                    .add_log(success_basic, LogLevel::Success);
+                            }
+                        }
+
+                        return Ok(receipt_option);
+                    }
                     Err(e) => {
                         let error_msg = format!("任务 {} 交易确认失败: {}", task_id, e);
                         app_state
                             .lock()
                             .unwrap()
                             .add_log(error_msg, LogLevel::Error);
-                        Err(anyhow!("交易确认失败"))
+                        return Err(anyhow!("交易确认失败"));
                     }
-                };
+                }
             }
             Err(e) => {
                 let error_text = e.to_string();
@@ -1645,13 +1806,95 @@ async fn submit_with_recovery<M: Middleware + 'static>(
                         }
                     }
                 } else if error_text.contains("underpriced") {
-                    // gas价格过低，增加gas价格
-                    let new_gas_price =
-                        gas_price_with_buffer * (retry_count as u64 + 2) / (retry_count as u64 + 1);
+                    // gas价格过低，智能调整gas价格
+
+                    // 计算当前挖矿收益估算 (3 MAG每次挖矿)
+                    let mining_reward = ethers::utils::parse_ether(3.0)?;
+
+                    // 估算交易所需gas量 (通常POW提交大约需要10-15万gas)
+                    let estimated_gas = U256::from(150_000);
+
+                    // 检查当前区块链状态，可能网络拥堵有变化
+                    let network_load_updated =
+                        match contract.client().get_block(BlockNumber::Latest).await {
+                            Ok(Some(block)) => {
+                                // gas_used和gas_limit已经是U256类型而不是Option<U256>
+                                let gas_used = block.gas_used;
+                                let gas_limit = block.gas_limit;
+                                if !gas_limit.is_zero() {
+                                    Some(gas_used.as_u128() as f64 / gas_limit.as_u128() as f64)
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        };
+
+                    // 如果网络负载更新成功，调整网络负载系数
+                    if let Some(new_load) = network_load_updated {
+                        if (new_load - network_load).abs() > 0.1 {
+                            // 网络负载变化超过10%
+                            network_load = new_load;
+                            let update_msg = format!(
+                                "任务 {} - 网络负载已更新: {:.1}%",
+                                task_id,
+                                network_load * 100.0
+                            );
+                            app_state
+                                .lock()
+                                .unwrap()
+                                .add_log(update_msg, LogLevel::Info);
+                        }
+                    }
+
+                    // 最小增长率（基础增长率，确保gas价格有足够增长以满足underpriced要求）
+                    // 当前设置为15%，较低的基础涨价可减少矿工成本
+                    let min_increase = 1150;
+
+                    // 根据网络负载和重试次数动态调整增幅
+                    let network_factor = match network_load {
+                        load if load > 0.8 => 10, // 高负载 +10% 额外增幅
+                        load if load > 0.6 => 5,  // 中高负载 +5% 额外增幅
+                        _ => 0,                   // 正常负载不额外增加
+                    };
+
+                    // 根据重试次数计算基础增幅
+                    let retry_factor = match retry_count {
+                        0 => 0,  // 第一次重试不额外增加基础增幅
+                        1 => 10, // 第二次重试 +10% 额外增幅
+                        _ => 25, // 最后重试 +25% 额外增幅
+                    };
+
+                    // 计算总增长率（基础1000 + 网络因子 + 重试因子）/ 10
+                    let increase_percent =
+                        (min_increase + network_factor * 10 + retry_factor * 10) / 10;
+
+                    // 计算最大可接受的gas价格（确保至少有40%的收益）
+                    let min_profit_ratio = 40; // 40%最低收益率，保证更好的收益
+                    let max_acceptable_gas_price: U256 =
+                        mining_reward * (100 - min_profit_ratio) / (estimated_gas * 100);
+
+                    let new_gas_price = gas_price_with_buffer * increase_percent / 100;
+
+                    // 确保不超过最大可接受价格
+                    let new_gas_price = std::cmp::min(new_gas_price, max_acceptable_gas_price);
+
+                    // 计算涨幅百分比
+                    let increase_ratio = (new_gas_price.as_u128() as f64
+                        / gas_price_with_buffer.as_u128() as f64)
+                        - 1.0;
+                    let increase_percent_display = (increase_ratio * 100.0) as u64;
+
                     let gas_msg = format!(
-                        "任务 {} gas价格过低，从 {:?} 增加到 {:?}",
-                        task_id, gas_price_with_buffer, new_gas_price
+                        "任务 {} - Gas价格过低调整: {} Gwei → {} Gwei (上涨{}%), 预计收益率: {}%",
+                        task_id,
+                        gas_price_with_buffer.as_u64() / 1_000_000_000,
+                        new_gas_price.as_u64() / 1_000_000_000,
+                        increase_percent_display,
+                        100 - (new_gas_price.as_u128() * estimated_gas.as_u128() * 100
+                            / mining_reward.as_u128()) as u64
                     );
+
                     app_state
                         .lock()
                         .unwrap()
