@@ -70,8 +70,16 @@ const MINING_TIMEOUT_SECS: u64 = 600; // 10分钟
                                       // MagnetChain的chainId
 const CHAIN_ID: u64 = 114514; // 修正为正确的链ID
 
+// 程序启动时间
+static mut APP_START_TIME: Option<Instant> = None;
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 记录程序启动时间
+    unsafe {
+        APP_START_TIME = Some(Instant::now());
+    }
+
     // 初始化应用状态
     let app_state = ui::create_app();
 
