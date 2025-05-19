@@ -1,4 +1,5 @@
 use crate::ui::app::{App, LogLevel, TaskInfo};
+use chrono::Local;
 use ratatui::{
     backend::Backend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -34,15 +35,16 @@ fn render_info_area(f: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(30), // 左侧占30%
-            Constraint::Percentage(70), // 右侧占70%
+            Constraint::Percentage(35), // 中间占35%
+            Constraint::Percentage(35), // 右侧占35%
         ])
         .split(area);
 
     // 渲染左侧钱包、合约和配置信息
     render_left_panel(f, app, chunks[0]);
 
-    // 将右侧区域再分为上下两部分
-    let right_chunks = Layout::default()
+    // 将中间区域划分为上下两部分
+    let middle_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Percentage(40), // 上部分占40%
@@ -50,11 +52,14 @@ fn render_info_area(f: &mut Frame, app: &App, area: Rect) {
         ])
         .split(chunks[1]);
 
-    // 渲染右上方挖矿摘要信息
-    render_mining_summary(f, app, right_chunks[0]);
+    // 渲染中间上方挖矿摘要信息
+    render_mining_summary(f, app, middle_chunks[0]);
 
-    // 渲染右下方任务列表
-    render_task_list(f, app, right_chunks[1]);
+    // 渲染中间下方任务列表
+    render_task_list(f, app, middle_chunks[1]);
+
+    // 渲染右侧耗时统计信息
+    render_timing_stats(f, app, chunks[2]);
 }
 
 // 渲染左侧面板（钱包、合约、配置信息）
@@ -401,6 +406,73 @@ fn render_task_list(f: &mut Frame, app: &App, area: Rect) {
         .header(header)
         .block(Block::default().borders(Borders::ALL).title("当前挖矿任务"));
     f.render_widget(task_table, area);
+}
+
+// 渲染耗时统计信息
+fn render_timing_stats(f: &mut Frame, app: &App, area: Rect) {
+    let stats = &app.timing_stats;
+
+    // 计算自上次更新以来的时间
+    let now = Local::now();
+    let time_since_update = now.signed_duration_since(stats.last_updated).num_seconds();
+
+    // 创建标题，包含更新时间
+    let update_status = if time_since_update < 10 {
+        format!("耗时统计 ({}秒前更新)", time_since_update)
+    } else {
+        format!("耗时统计 ({}秒前更新)", time_since_update)
+    };
+
+    // 创建耗时信息
+    let stats_text = vec![
+        Line::from(vec![
+            Span::styled("任务获取: ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{:.1} ms", stats.avg_task_request_time_ms)),
+        ]),
+        Line::from(vec![
+            Span::styled("平均计算: ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{:.2} 秒", stats.avg_calculation_time_sec)),
+        ]),
+        Line::from(vec![
+            Span::styled("平均提交: ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{:.2} 秒", stats.avg_submission_time_sec)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("任务数量: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!(
+                "{} 请求, {} 完成",
+                stats.total_tasks_requested, stats.total_tasks_calculated
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("提交成功: ", Style::default().fg(Color::Green)),
+            Span::raw(format!("{} ", stats.total_tasks_submitted)),
+            Span::styled("失败: ", Style::default().fg(Color::Red)),
+            Span::raw(format!("{}", stats.total_submissions_failed)),
+        ]),
+        Line::from(vec![
+            Span::styled("请求失败: ", Style::default().fg(Color::Red)),
+            Span::raw(format!("{}", stats.total_requests_failed)),
+        ]),
+        Line::from(vec![
+            Span::styled("计算失败: ", Style::default().fg(Color::Red)),
+            Span::raw(format!("{}", stats.total_calculations_failed)),
+        ]),
+    ];
+
+    // 创建统计区块
+    let stats_block = Block::default()
+        .title(update_status)
+        .borders(Borders::ALL)
+        .style(Style::default().fg(Color::White))
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let stats_para = Paragraph::new(stats_text)
+        .block(stats_block)
+        .wrap(Wrap { trim: true });
+
+    f.render_widget(stats_para, area);
 }
 
 // 渲染日志区域

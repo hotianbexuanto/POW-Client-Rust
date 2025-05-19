@@ -1,7 +1,12 @@
 use chrono::{DateTime, Local};
+use colored::Colorize;
 use ethers::types::{Address, U256};
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 // 日志消息结构体
 #[derive(Clone, Debug)]
@@ -40,6 +45,38 @@ pub struct MiningStatus {
     pub total_hash_rate: f64,
     pub uptime: u64,      // 以秒为单位
     pub total_mined: f64, // 总计挖矿获得的MAG
+}
+
+// 任务处理耗时统计
+#[derive(Clone, Debug)]
+pub struct TaskTimingStats {
+    pub avg_task_request_time_ms: f64,    // 平均任务获取耗时(毫秒)
+    pub avg_calculation_time_sec: f64,    // 平均计算耗时(秒)
+    pub avg_submission_time_sec: f64,     // 平均提交耗时(秒)
+    pub total_tasks_requested: usize,     // 总请求任务数
+    pub total_tasks_calculated: usize,    // 总计算完成的任务数
+    pub total_tasks_submitted: usize,     // 总提交的任务数
+    pub total_requests_failed: usize,     // 总任务请求失败数
+    pub total_calculations_failed: usize, // 总计算失败数
+    pub total_submissions_failed: usize,  // 总提交失败数
+    pub last_updated: DateTime<Local>,    // 最后更新时间
+}
+
+impl Default for TaskTimingStats {
+    fn default() -> Self {
+        Self {
+            avg_task_request_time_ms: 0.0,
+            avg_calculation_time_sec: 0.0,
+            avg_submission_time_sec: 0.0,
+            total_tasks_requested: 0,
+            total_tasks_calculated: 0,
+            total_tasks_submitted: 0,
+            total_requests_failed: 0,
+            total_calculations_failed: 0,
+            total_submissions_failed: 0,
+            last_updated: Local::now(),
+        }
+    }
 }
 
 // 应用状态
@@ -87,6 +124,8 @@ pub struct App {
     pub tasks: Vec<TaskInfo>,
     // 挖矿状态
     pub mining_status: MiningStatus,
+    // 任务耗时统计
+    pub timing_stats: TaskTimingStats,
     // 日志
     pub logs: VecDeque<LogMessage>,
     // 日志容量
@@ -118,6 +157,7 @@ impl App {
                 uptime: 0,
                 total_mined: 0.0,
             },
+            timing_stats: TaskTimingStats::default(),
             logs: VecDeque::new(),
             max_logs: 1000,
             current_rpc: None,
@@ -294,6 +334,51 @@ impl App {
     // 设置配置
     pub fn set_config(&mut self, config: AppConfig) {
         self.config = config;
+    }
+
+    // 添加任务请求耗时记录
+    pub fn record_task_request_time(&mut self, time_ms: f64, success: bool) {
+        if success {
+            // 更新平均请求时间（加权平均）
+            let total_requests = self.timing_stats.total_tasks_requested as f64;
+            self.timing_stats.avg_task_request_time_ms =
+                (self.timing_stats.avg_task_request_time_ms * total_requests + time_ms)
+                    / (total_requests + 1.0);
+            self.timing_stats.total_tasks_requested += 1;
+        } else {
+            self.timing_stats.total_requests_failed += 1;
+        }
+        self.timing_stats.last_updated = Local::now();
+    }
+
+    // 添加任务计算耗时记录
+    pub fn record_calculation_time(&mut self, time_sec: f64, success: bool) {
+        if success {
+            // 更新平均计算时间（加权平均）
+            let total_calcs = self.timing_stats.total_tasks_calculated as f64;
+            self.timing_stats.avg_calculation_time_sec =
+                (self.timing_stats.avg_calculation_time_sec * total_calcs + time_sec)
+                    / (total_calcs + 1.0);
+            self.timing_stats.total_tasks_calculated += 1;
+        } else {
+            self.timing_stats.total_calculations_failed += 1;
+        }
+        self.timing_stats.last_updated = Local::now();
+    }
+
+    // 添加任务提交耗时记录
+    pub fn record_submission_time(&mut self, time_sec: f64, success: bool) {
+        if success {
+            // 更新平均提交时间（加权平均）
+            let total_submissions = self.timing_stats.total_tasks_submitted as f64;
+            self.timing_stats.avg_submission_time_sec =
+                (self.timing_stats.avg_submission_time_sec * total_submissions + time_sec)
+                    / (total_submissions + 1.0);
+            self.timing_stats.total_tasks_submitted += 1;
+        } else {
+            self.timing_stats.total_submissions_failed += 1;
+        }
+        self.timing_stats.last_updated = Local::now();
     }
 
     // 清理旧任务

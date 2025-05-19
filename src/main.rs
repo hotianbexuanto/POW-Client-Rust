@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use chrono::Local;
 use colored::Colorize;
 use console::Term;
 use dialoguer::{theme::ColorfulTheme, Input, Select};
@@ -237,6 +238,10 @@ async fn main() -> Result<()> {
     });
 
     // 启动UI循环
+    // 用于定时更新统计UI的计时器
+    let mut last_stats_update = Instant::now();
+    let stats_update_interval = Duration::from_secs(5); // 每5秒更新一次统计
+
     loop {
         // 渲染TUI
         terminal.draw(|f| {
@@ -256,6 +261,13 @@ async fn main() -> Result<()> {
             Some(Event::Tick) => {
                 // 定时更新 - 可以在这里更新一些实时数据
                 app_state.lock().unwrap().increment_uptime();
+
+                // 每5秒更新一次统计UI
+                if last_stats_update.elapsed() >= stats_update_interval {
+                    let now = chrono::Local::now();
+                    app_state.lock().unwrap().timing_stats.last_updated = now;
+                    last_stats_update = Instant::now();
+                }
             }
             None => break,
         }
@@ -881,6 +893,9 @@ async fn request_and_calculate<M: Middleware + 'static>(
     task_id: usize,
     app_state: &Arc<Mutex<App>>,
 ) -> Result<U256> {
+    // 记录任务请求开始时间
+    let request_start_time = Instant::now();
+
     // 更新任务状态
     app_state
         .lock()
@@ -889,19 +904,71 @@ async fn request_and_calculate<M: Middleware + 'static>(
 
     // 请求挖矿任务
     let tx_request = contract.request_mining_task();
-    let pending_tx = tx_request.send().await?;
-    let receipt = pending_tx.await?;
+    let pending_tx = match tx_request.send().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            // 记录请求失败
+            app_state
+                .lock()
+                .unwrap()
+                .record_task_request_time(request_start_time.elapsed().as_millis() as f64, false);
+            return Err(anyhow!("请求挖矿任务失败: {}", e));
+        }
+    };
+
+    let receipt = match pending_tx.await {
+        Ok(r) => r,
+        Err(e) => {
+            // 记录请求失败
+            app_state
+                .lock()
+                .unwrap()
+                .record_task_request_time(request_start_time.elapsed().as_millis() as f64, false);
+            return Err(anyhow!("交易确认失败: {}", e));
+        }
+    };
 
     if receipt.is_none() {
+        // 记录请求失败
+        app_state
+            .lock()
+            .unwrap()
+            .record_task_request_time(request_start_time.elapsed().as_millis() as f64, false);
         return Err(anyhow!("交易确认失败"));
     }
 
     // 获取挖矿任务
-    let (nonce, difficulty, active) = contract.get_my_task().call().await?;
+    let (nonce, difficulty, active) = match contract.get_my_task().call().await {
+        Ok(result) => result,
+        Err(e) => {
+            // 记录请求失败
+            app_state
+                .lock()
+                .unwrap()
+                .record_task_request_time(request_start_time.elapsed().as_millis() as f64, false);
+            return Err(anyhow!("获取任务数据失败: {}", e));
+        }
+    };
 
     if !active {
+        // 记录请求失败
+        app_state
+            .lock()
+            .unwrap()
+            .record_task_request_time(request_start_time.elapsed().as_millis() as f64, false);
         return Err(anyhow!("挖矿任务未激活"));
     }
+
+    // 记录请求成功及耗时
+    let request_time = request_start_time.elapsed().as_millis() as f64;
+    app_state
+        .lock()
+        .unwrap()
+        .record_task_request_time(request_time, true);
+
+    // 日志记录请求时间
+    let time_msg = format!("任务 {} - 请求耗时: {:.2}毫秒", task_id, request_time);
+    app_state.lock().unwrap().add_log(time_msg, LogLevel::Info);
 
     // 更新任务数据
     app_state
@@ -922,11 +989,35 @@ async fn request_and_calculate<M: Middleware + 'static>(
         .unwrap()
         .update_task(task_id, "计算中".to_string());
 
+    // 记录计算开始时间
+    let calculation_start_time = Instant::now();
+
     // 计算解决方案
     let address = contract.client().address();
-    let solution = await_solution(nonce, address, difficulty, task_id, app_state.clone()).await?;
+    let solution =
+        match await_solution(nonce, address, difficulty, task_id, app_state.clone()).await {
+            Ok(s) => s,
+            Err(e) => {
+                // 记录计算失败
+                app_state
+                    .lock()
+                    .unwrap()
+                    .record_calculation_time(calculation_start_time.elapsed().as_secs_f64(), false);
+                return Err(e);
+            }
+        };
 
-    let solution_msg = format!("任务 {} - 找到解决方案: {:?}", task_id, solution);
+    // 记录计算成功及耗时
+    let calculation_time = calculation_start_time.elapsed().as_secs_f64();
+    app_state
+        .lock()
+        .unwrap()
+        .record_calculation_time(calculation_time, true);
+
+    let solution_msg = format!(
+        "任务 {} - 找到解决方案: {:?}, 计算耗时: {:.2}秒",
+        task_id, solution, calculation_time
+    );
     app_state
         .lock()
         .unwrap()
@@ -1619,6 +1710,9 @@ async fn submit_with_recovery<M: Middleware + 'static>(
     task_id: usize,
     app_state: &Arc<Mutex<App>>,
 ) -> Result<Option<TransactionReceipt>> {
+    // 记录提交开始时间
+    let submit_start_time = Instant::now();
+
     let mut retry_count = 0;
     const MAX_RETRIES: usize = 3;
 
@@ -1739,6 +1833,8 @@ async fn submit_with_recovery<M: Middleware + 'static>(
                 // 等待交易确认
                 match pending_tx.await {
                     Ok(receipt_option) => {
+                        let total_time = submit_start_time.elapsed().as_secs_f64();
+
                         if let Some(receipt) = receipt_option.as_ref() {
                             // 计算实际gas使用和成本
                             if let Some(gas_used) = receipt.gas_used {
@@ -1749,16 +1845,18 @@ async fn submit_with_recovery<M: Middleware + 'static>(
                                 let profit_percent = profit / 3.0 * 100.0;
 
                                 let success_msg = format!(
-                                    "任务 {} 挖矿成功！使用Gas: {}, 成本: {} MAG, 利润: {:.4} MAG ({:.1}%)",
-                                    task_id, gas_used, gas_cost_eth, profit, profit_percent
+                                    "任务 {} 挖矿成功！使用Gas: {}, 成本: {} MAG, 利润: {:.4} MAG ({:.1}%), 提交耗时: {:.2}秒",
+                                    task_id, gas_used, gas_cost_eth, profit, profit_percent, total_time
                                 );
                                 app_state
                                     .lock()
                                     .unwrap()
                                     .add_log(success_msg, LogLevel::Success);
                             } else {
-                                let success_basic =
-                                    format!("任务 {} 挖矿成功！交易已确认", task_id);
+                                let success_basic = format!(
+                                    "任务 {} 挖矿成功！交易已确认，提交耗时: {:.2}秒",
+                                    task_id, total_time
+                                );
                                 app_state
                                     .lock()
                                     .unwrap()
@@ -1766,6 +1864,11 @@ async fn submit_with_recovery<M: Middleware + 'static>(
                             }
                         }
 
+                        // 记录提交成功及耗时
+                        app_state
+                            .lock()
+                            .unwrap()
+                            .record_submission_time(total_time, true);
                         return Ok(receipt_option);
                     }
                     Err(e) => {
@@ -1774,6 +1877,12 @@ async fn submit_with_recovery<M: Middleware + 'static>(
                             .lock()
                             .unwrap()
                             .add_log(error_msg, LogLevel::Error);
+
+                        // 记录提交失败
+                        app_state.lock().unwrap().record_submission_time(
+                            submit_start_time.elapsed().as_secs_f64(),
+                            false,
+                        );
                         return Err(anyhow!("交易确认失败"));
                     }
                 }
@@ -1803,6 +1912,12 @@ async fn submit_with_recovery<M: Middleware + 'static>(
                                 .lock()
                                 .unwrap()
                                 .add_log(error_msg, LogLevel::Error);
+
+                            // 记录提交失败
+                            app_state.lock().unwrap().record_submission_time(
+                                submit_start_time.elapsed().as_secs_f64(),
+                                false,
+                            );
                             return Err(anyhow!(nonce_err));
                         }
                     }
@@ -1910,6 +2025,12 @@ async fn submit_with_recovery<M: Middleware + 'static>(
                         .lock()
                         .unwrap()
                         .add_log(error_msg, LogLevel::Error);
+
+                    // 记录提交失败
+                    app_state
+                        .lock()
+                        .unwrap()
+                        .record_submission_time(submit_start_time.elapsed().as_secs_f64(), false);
                     return Err(anyhow!(e));
                 }
             }
@@ -1928,6 +2049,12 @@ async fn submit_with_recovery<M: Middleware + 'static>(
         // 等待一会儿再重试
         sleep(Duration::from_millis(500)).await;
     }
+
+    // 记录提交失败（达到最大重试次数）
+    app_state
+        .lock()
+        .unwrap()
+        .record_submission_time(submit_start_time.elapsed().as_secs_f64(), false);
 
     Err(anyhow!("达到最大重试次数，提交失败"))
 }
