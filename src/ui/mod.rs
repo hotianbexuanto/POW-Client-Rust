@@ -64,4 +64,4 @@ pub fn create_app() -> Arc<Mutex<App>> {
 }
 
 // 定义tick_rate常量
-const TICK_RATE: Duration = Duration::from_millis(200);
+const TICK_RATE: Duration = Duration::from_secs(1);

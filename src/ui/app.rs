@@ -2,12 +2,6 @@ use chrono::{DateTime, Local};
 use ethers::types::{Address, U256};
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
-
-// 引用main.rs中的全局启动时间
-extern "C" {
-    static mut APP_START_TIME: Option<Instant>;
-}
 
 // 日志消息结构体
 #[derive(Clone, Debug)]
@@ -247,16 +241,12 @@ impl App {
     pub fn update_mining_status(&mut self, active_tasks: usize, total_hash_rate: f64) {
         self.mining_status.active_tasks = active_tasks;
         self.mining_status.total_hash_rate = total_hash_rate;
+        // 不再在这里增加uptime
+    }
 
-        // 使用程序启动时间计算正确的运行时间
-        unsafe {
-            if let Some(start_time) = APP_START_TIME {
-                self.mining_status.uptime = start_time.elapsed().as_secs();
-            } else {
-                // 如果没有启动时间记录，则继续使用自增方式
-                self.mining_status.uptime += 1;
-            }
-        }
+    // 增加运行时间
+    pub fn increment_uptime(&mut self) {
+        self.mining_status.uptime += 1; // 增加1秒
     }
 
     // 增加解决方案计数 - 不再更新挖矿收益，只更新解决方案计数
