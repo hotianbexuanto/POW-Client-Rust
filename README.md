@@ -74,6 +74,23 @@ chmod +x pow-client-termux-arm64
 3. 程序会自动检查余额并开始挖矿
 4. 挖矿成功会自动获取奖励
 
+### 自定义RPC节点
+
+您可以通过以下两种方式使用自定义RPC节点：
+
+1. **通过界面输入**：程序启动时会提示您是否使用自定义RPC节点，输入节点URL即可
+
+2. **通过配置文件**：在程序目录下创建`nodes.txt`文件，每行添加一个RPC节点地址，例如：
+```
+https://rpc1.example.com
+https://rpc2.example.com
+https://rpc3.example.com
+```
+
+程序会自动加载这些节点并与内置节点一起测试，选择响应最快的节点。这对于提高请求和提交速度非常有帮助。
+
+参考示例文件`nodes.txt.example`获取更多信息。
+
 ## GitHub Actions自动构建
 
 本项目使用GitHub Actions自动构建多平台可执行文件：
