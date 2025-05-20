@@ -1670,7 +1670,12 @@ fn configure_mining_parameters(app_state: &Arc<Mutex<App>>) {
         }
     );
 
-    let auto_select_options = ["自动选择 RPC 节点", "手动选择 RPC 节点"];
+    // 添加三个选项：自动选择、手动选择和手动输入
+    let auto_select_options = [
+        "自动选择 RPC 节点",
+        "手动选择 RPC 节点",
+        "手动输入 RPC 节点",
+    ];
     let auto_select_default = if default_auto_select_rpc { 0 } else { 1 };
 
     let auto_select_index = Select::new()
@@ -1682,11 +1687,34 @@ fn configure_mining_parameters(app_state: &Arc<Mutex<App>>) {
 
     let auto_select_rpc = auto_select_index == 0;
 
+    // 如果选择了手动输入，则提示用户输入RPC节点URL
+    let mut custom_rpc = None;
+    if auto_select_index == 2 {
+        let rpc_url: String = Input::new()
+            .with_prompt("请输入自定义 RPC 节点 URL / Enter custom RPC node URL")
+            .validate_with(|input: &String| -> Result<(), &str> {
+                if input.starts_with("http://") || input.starts_with("https://") {
+                    Ok(())
+                } else {
+                    Err("RPC URL 必须以 http:// 或 https:// 开头 / RPC URL must start with http:// or https://")
+                }
+            })
+            .interact()
+            .unwrap_or_else(|_| "https://node1.magnetchain.xyz".to_string());
+
+        custom_rpc = Some(rpc_url);
+    }
+
     // 更新配置
     let mut app = app_state.lock().unwrap();
     app.config.task_count = task_count;
     app.config.thread_count = thread_count;
     app.config.auto_select_rpc = auto_select_rpc;
+
+    // 如果有自定义RPC节点，则更新
+    if let Some(rpc_url) = custom_rpc {
+        app.custom_rpc = Some(rpc_url);
+    }
 
     // 输出配置信息
     let rpc_mode = if auto_select_index == 2 {
