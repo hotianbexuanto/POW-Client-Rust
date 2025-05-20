@@ -132,6 +132,8 @@ pub struct App {
     pub max_logs: usize,
     // 当前选择的RPC节点
     pub current_rpc: Option<String>,
+    // 自定义RPC节点
+    pub custom_rpc: Option<String>,
     // RPC节点响应时间（毫秒）
     pub rpc_response_times: HashMap<String, u64>,
     // 日志滚动位置
@@ -161,6 +163,7 @@ impl App {
             logs: VecDeque::new(),
             max_logs: 1000,
             current_rpc: None,
+            custom_rpc: None,
             rpc_response_times: HashMap::new(),
             log_scroll: 0,
         }

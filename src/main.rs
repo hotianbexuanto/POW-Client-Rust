@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
                     .add_log(format!("已选择 RPC: {}", selected_rpc), LogLevel::Info);
 
                 // 初始化以太坊提供者
-                match Provider::<Http>::try_from(selected_rpc) {
+                match Provider::<Http>::try_from(selected_rpc.clone()) {
                     Ok(provider_instance) => {
                         rpc_url = Some(selected_rpc);
                         provider = Some(provider_instance);
@@ -1689,15 +1689,17 @@ fn configure_mining_parameters(app_state: &Arc<Mutex<App>>) {
     app.config.auto_select_rpc = auto_select_rpc;
 
     // 输出配置信息
+    let rpc_mode = if auto_select_index == 2 {
+        "手动输入"
+    } else if auto_select_rpc {
+        "自动选择"
+    } else {
+        "手动选择"
+    };
+
     let config_msg = format!(
         "已设置挖矿配置 - 使用 {} 个任务，每个任务 {} 个线程，RPC节点获取方式: {}",
-        task_count,
-        thread_count,
-        if auto_select_rpc {
-            "自动选择"
-        } else {
-            "手动选择"
-        }
+        task_count, thread_count, rpc_mode
     );
     println!("{}", config_msg.green());
     app.add_log(config_msg, LogLevel::Info);

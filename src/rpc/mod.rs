@@ -77,7 +77,7 @@ pub async fn test_all_rpc_nodes(app_state: &Arc<Mutex<App>>) -> Result<HashMap<&
 }
 
 // 找到最快的RPC节点
-pub async fn find_fastest_rpc(app_state: &Arc<Mutex<App>>) -> Result<&'static str> {
+pub async fn find_fastest_rpc(app_state: &Arc<Mutex<App>>) -> Result<String> {
     let log_msg = "正在自动测试所有RPC节点以找到最快的节点...";
     println!("{}", log_msg.cyan());
     app_state
@@ -133,11 +133,47 @@ pub async fn find_fastest_rpc(app_state: &Arc<Mutex<App>>) -> Result<&'static st
         .unwrap()
         .add_log(log_msg, crate::ui::app::LogLevel::Success);
 
-    Ok(fastest_rpc)
+    Ok(fastest_rpc.to_string())
 }
 
 // 手动选择RPC节点
-pub async fn select_rpc_node(app_state: &Arc<Mutex<App>>) -> Result<&'static str> {
+pub async fn select_rpc_node(app_state: &Arc<Mutex<App>>) -> Result<String> {
+    // 首先检查是否有自定义RPC节点
+    if let Some(custom_rpc) = app_state.lock().unwrap().custom_rpc.clone() {
+        // 测试自定义RPC节点是否可用
+        match test_rpc_node(&custom_rpc).await {
+            Ok(response_time) => {
+                app_state
+                    .lock()
+                    .unwrap()
+                    .update_rpc_response_time(custom_rpc.clone(), response_time);
+                app_state.lock().unwrap().current_rpc = Some(custom_rpc.clone());
+
+                let log_msg = format!("使用自定义RPC节点: {} ({}ms)", custom_rpc, response_time);
+                println!("{}", log_msg.green());
+                app_state
+                    .lock()
+                    .unwrap()
+                    .add_log(log_msg, crate::ui::app::LogLevel::Success);
+
+                return Ok(custom_rpc);
+            }
+            Err(e) => {
+                let error_msg = format!("自定义RPC节点不可用: {}. 将尝试其他节点。", e);
+                println!("{}", error_msg.yellow());
+                app_state
+                    .lock()
+                    .unwrap()
+                    .add_log(error_msg, crate::ui::app::LogLevel::Warning);
+
+                // 清除无效的自定义RPC节点
+                app_state.lock().unwrap().custom_rpc = None;
+
+                // 继续下一步自动或手动选择
+            }
+        }
+    }
+
     // 如果启用了自动选择，则尝试找到最快的节点
     if app_state.lock().unwrap().config.auto_select_rpc {
         match find_fastest_rpc(app_state).await {
@@ -190,7 +226,7 @@ pub async fn select_rpc_node(app_state: &Arc<Mutex<App>>) -> Result<&'static str
                 .unwrap()
                 .add_log(log_msg, crate::ui::app::LogLevel::Success);
 
-            Ok(selected_rpc)
+            Ok(selected_rpc.to_string())
         }
         Err(e) => {
             let error_msg = format!("所选RPC节点不可用: {}. 请选择其他节点。", e);

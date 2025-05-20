@@ -148,7 +148,7 @@ fn render_contract_info(f: &mut Frame, app: &App, area: Rect) {
 // 渲染配置信息
 fn render_config_info(f: &mut Frame, app: &App, area: Rect) {
     // 配置信息
-    let config_info = vec![
+    let mut config_info = vec![
         Line::from(vec![
             Span::styled("挖矿模式: ", Style::default().fg(Color::Yellow)),
             Span::raw("单任务多线程"),
@@ -173,14 +173,24 @@ fn render_config_info(f: &mut Frame, app: &App, area: Rect) {
                 "否"
             }),
         ]),
-        Line::from(vec![
-            Span::styled("RPC节点: ", Style::default().fg(Color::Yellow)),
-            Span::raw(match &app.current_rpc {
-                Some(rpc) => rpc.clone(),
-                None => "未选择".to_string(),
-            }),
-        ]),
     ];
+
+    // 如果有自定义RPC，显示自定义RPC信息
+    if let Some(custom_rpc) = &app.custom_rpc {
+        config_info.push(Line::from(vec![
+            Span::styled("自定义RPC节点: ", Style::default().fg(Color::Yellow)),
+            Span::styled(custom_rpc.clone(), Style::default().fg(Color::Cyan)),
+        ]));
+    }
+
+    // 当前RPC节点
+    config_info.push(Line::from(vec![
+        Span::styled("当前RPC节点: ", Style::default().fg(Color::Yellow)),
+        Span::raw(match &app.current_rpc {
+            Some(rpc) => rpc.clone(),
+            None => "未选择".to_string(),
+        }),
+    ]));
 
     // 渲染配置信息
     let config_block = Block::default().borders(Borders::ALL).title("配置信息");
