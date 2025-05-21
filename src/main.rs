@@ -73,10 +73,34 @@ const CHAIN_ID: u64 = 114514; // 修正为正确的链ID
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 初始化应用状态
-    let app_state = ui::create_app();
-
+    // 显示欢迎信息
     print_welcome_message();
+
+    // 初始化应用状态
+    let app_state = Arc::new(Mutex::new(App::new()));
+
+    // 初始化RPC节点负载均衡器
+    match rpc::init_load_balancer(&app_state).await {
+        Ok(_) => {
+            let log_msg = "负载均衡器初始化成功，将自动选择最佳RPC节点";
+            println!("{}", log_msg.green());
+            app_state
+                .lock()
+                .unwrap()
+                .add_log(log_msg.to_string(), ui::app::LogLevel::Success);
+        }
+        Err(e) => {
+            let error_msg = format!("负载均衡器初始化失败: {}，将使用传统节点选择方式", e);
+            println!("{}", error_msg.yellow());
+            app_state
+                .lock()
+                .unwrap()
+                .add_log(error_msg, ui::app::LogLevel::Warning);
+
+            // 禁用负载均衡
+            app_state.lock().unwrap().active_load_balancer = false;
+        }
+    }
 
     // 尝试连接RPC节点
     let mut rpc_url = None;
@@ -551,56 +575,49 @@ async fn start_mining_loop<M: Middleware + 'static>(
     let submit_app_state = app_state.clone();
     tokio::spawn(async move {
         while let Some((submit_task_id, solution)) = submit_rx.recv().await {
+            // 使用clone的方式避免跨await持有锁
             let result_msg = format!("后台处理 - 提交任务 {} 的解决方案", submit_task_id);
-            submit_app_state
-                .lock()
-                .unwrap()
-                .add_log(result_msg, LogLevel::Info);
-
-            // 更新任务状态为提交中
-            submit_app_state
-                .lock()
-                .unwrap()
-                .update_task(submit_task_id, "提交中".to_string());
+            {
+                let mut app = submit_app_state.lock().unwrap();
+                app.add_log(result_msg, LogLevel::Info);
+                // 更新任务状态为提交中
+                app.update_task(submit_task_id, "提交中".to_string());
+            }
 
             // 获取当前任务信息，验证任务是否仍然有效
             match submit_contract.get_my_task().call().await {
                 Ok((current_nonce, current_difficulty, active)) => {
                     if !active {
                         let error_msg = format!("任务 {} 已失效，跳过提交", submit_task_id);
-                        submit_app_state
-                            .lock()
-                            .unwrap()
-                            .add_log(error_msg, LogLevel::Warning);
-                        submit_app_state
-                            .lock()
-                            .unwrap()
-                            .update_task(submit_task_id, "任务已失效".to_string());
+                        {
+                            let mut app = submit_app_state.lock().unwrap();
+                            app.add_log(error_msg, LogLevel::Warning);
+                            app.update_task(submit_task_id, "任务已失效".to_string());
+                        }
                         continue;
                     }
 
                     // 再次验证解决方案
                     let address = submit_contract.client().address();
-                    match verify_solution_locally(
+                    let validation_result = verify_solution_locally(
                         current_nonce,
                         address,
                         solution,
                         current_difficulty,
-                    ) {
+                    );
+
+                    match validation_result {
                         Ok(valid) => {
                             if !valid {
                                 let error_msg = format!(
                                     "任务 {} 解决方案不再满足难度要求，跳过提交",
                                     submit_task_id
                                 );
-                                submit_app_state
-                                    .lock()
-                                    .unwrap()
-                                    .add_log(error_msg, LogLevel::Warning);
-                                submit_app_state
-                                    .lock()
-                                    .unwrap()
-                                    .update_task(submit_task_id, "验证失败".to_string());
+                                {
+                                    let mut app = submit_app_state.lock().unwrap();
+                                    app.add_log(error_msg, LogLevel::Warning);
+                                    app.update_task(submit_task_id, "验证失败".to_string());
+                                }
                                 continue;
                             }
                         }
@@ -609,14 +626,11 @@ async fn start_mining_loop<M: Middleware + 'static>(
                                 "任务 {} 解决方案验证出错: {}, 跳过提交",
                                 submit_task_id, e
                             );
-                            submit_app_state
-                                .lock()
-                                .unwrap()
-                                .add_log(error_msg, LogLevel::Error);
-                            submit_app_state
-                                .lock()
-                                .unwrap()
-                                .update_task(submit_task_id, "验证错误".to_string());
+                            {
+                                let mut app = submit_app_state.lock().unwrap();
+                                app.add_log(error_msg, LogLevel::Error);
+                                app.update_task(submit_task_id, "验证错误".to_string());
+                            }
                             continue;
                         }
                     }
@@ -624,83 +638,74 @@ async fn start_mining_loop<M: Middleware + 'static>(
                 Err(e) => {
                     let error_msg =
                         format!("获取任务 {} 信息失败: {}, 尝试直接提交", submit_task_id, e);
-                    submit_app_state
-                        .lock()
-                        .unwrap()
-                        .add_log(error_msg, LogLevel::Warning);
+                    {
+                        let mut app = submit_app_state.lock().unwrap();
+                        app.add_log(error_msg, LogLevel::Warning);
+                    }
                 }
             }
 
             // 执行提交
-            match submit_with_recovery(
+            let submit_result = submit_with_recovery(
                 &submit_contract,
                 solution,
                 submit_task_id,
                 &submit_app_state,
             )
-            .await
-            {
+            .await;
+
+            match submit_result {
                 Ok(Some(receipt)) => {
                     // 检查交易状态
                     if receipt.status.unwrap_or_default() == U64::from(1) {
                         let success_msg =
                             format!("任务 {} 的解决方案已确认，交易成功", submit_task_id);
-                        submit_app_state
-                            .lock()
-                            .unwrap()
-                            .add_log(success_msg, LogLevel::Success);
-
-                        // 更新任务状态为成功
-                        submit_app_state
-                            .lock()
-                            .unwrap()
-                            .update_task(submit_task_id, "成功".to_string());
+                        {
+                            let mut app = submit_app_state.lock().unwrap();
+                            app.add_log(success_msg, LogLevel::Success);
+                            // 更新任务状态为成功
+                            app.update_task(submit_task_id, "成功".to_string());
+                        }
 
                         // 在提交成功后更新钱包余额
-                        if let Err(e) =
-                            update_wallet_balance(&submit_contract, &submit_app_state).await
-                        {
-                            let error_msg =
-                                format!("任务 {} 提交后更新钱包余额失败: {}", submit_task_id, e);
-                            submit_app_state
-                                .lock()
-                                .unwrap()
-                                .add_log(error_msg, LogLevel::Warning);
-                        } else {
-                            let update_msg =
-                                format!("任务 {} 提交成功后更新钱包余额成功", submit_task_id);
-                            submit_app_state
-                                .lock()
-                                .unwrap()
-                                .add_log(update_msg, LogLevel::Success);
+                        let balance_update_result =
+                            update_wallet_balance(&submit_contract, &submit_app_state).await;
+
+                        match balance_update_result {
+                            Err(e) => {
+                                let error_msg = format!(
+                                    "任务 {} 提交后更新钱包余额失败: {}",
+                                    submit_task_id, e
+                                );
+                                let mut app = submit_app_state.lock().unwrap();
+                                app.add_log(error_msg, LogLevel::Warning);
+                            }
+                            Ok(_) => {
+                                let update_msg =
+                                    format!("任务 {} 提交成功后更新钱包余额成功", submit_task_id);
+                                let mut app = submit_app_state.lock().unwrap();
+                                app.add_log(update_msg, LogLevel::Success);
+                            }
                         }
                     } else {
                         let error_msg =
                             format!("任务 {} 的解决方案交易失败，请检查链上状态", submit_task_id);
-                        submit_app_state
-                            .lock()
-                            .unwrap()
-                            .add_log(error_msg, LogLevel::Error);
-
-                        // 更新任务状态为交易失败
-                        submit_app_state
-                            .lock()
-                            .unwrap()
-                            .update_task(submit_task_id, "交易失败".to_string());
+                        {
+                            let mut app = submit_app_state.lock().unwrap();
+                            app.add_log(error_msg, LogLevel::Error);
+                            // 更新任务状态为交易失败
+                            app.update_task(submit_task_id, "交易失败".to_string());
+                        }
                     }
                 }
                 Ok(None) => {
                     let error_msg = format!("任务 {} 的解决方案交易未能确认", submit_task_id);
-                    submit_app_state
-                        .lock()
-                        .unwrap()
-                        .add_log(error_msg, LogLevel::Error);
-
-                    // 更新任务状态为失败
-                    submit_app_state
-                        .lock()
-                        .unwrap()
-                        .update_task(submit_task_id, "确认失败".to_string());
+                    {
+                        let mut app = submit_app_state.lock().unwrap();
+                        app.add_log(error_msg, LogLevel::Error);
+                        // 更新任务状态为失败
+                        app.update_task(submit_task_id, "确认失败".to_string());
+                    }
                 }
                 Err(e) => {
                     // 尝试解析错误消息，给用户更清晰的提示
@@ -724,16 +729,12 @@ async fn start_mining_loop<M: Middleware + 'static>(
                         format!("任务 {} 后台提交失败: {}", submit_task_id, e)
                     };
 
-                    submit_app_state
-                        .lock()
-                        .unwrap()
-                        .add_log(parsed_msg, LogLevel::Error);
-
-                    // 更新任务状态为提交失败，这样UI就不会继续显示它
-                    submit_app_state
-                        .lock()
-                        .unwrap()
-                        .update_task(submit_task_id, "提交失败".to_string());
+                    {
+                        let mut app = submit_app_state.lock().unwrap();
+                        app.add_log(parsed_msg, LogLevel::Error);
+                        // 更新任务状态为提交失败，这样UI就不会继续显示它
+                        app.update_task(submit_task_id, "提交失败".to_string());
+                    }
                 }
             }
         }
@@ -902,161 +903,295 @@ async fn request_and_calculate<M: Middleware + 'static>(
         .unwrap()
         .update_task(task_id, "请求中".to_string());
 
-    // 请求挖矿任务
-    let tx_request = contract.request_mining_task();
-    let pending_tx = match tx_request.send().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            // 记录请求失败
-            app_state
-                .lock()
-                .unwrap()
-                .record_task_request_time(request_start_time.elapsed().as_millis() as f64, false);
-            return Err(anyhow!("请求挖矿任务失败: {}", e));
-        }
-    };
+    // 使用负载均衡器执行请求
+    let use_load_balancer = app_state.lock().unwrap().active_load_balancer;
 
-    let receipt = match pending_tx.await {
-        Ok(r) => r,
-        Err(e) => {
-            // 记录请求失败
-            app_state
-                .lock()
-                .unwrap()
-                .record_task_request_time(request_start_time.elapsed().as_millis() as f64, false);
-            return Err(anyhow!("交易确认失败: {}", e));
-        }
-    };
+    if use_load_balancer {
+        // 创建请求函数
+        let request_func = |_rpc_url: &str| {
+            let contract_clone = contract.clone();
+            Box::pin(async move {
+                // 请求挖矿任务
+                let tx_request = contract_clone.request_mining_task();
+                let pending_tx = tx_request.send().await?;
+                let receipt = pending_tx.await?;
 
-    if receipt.is_none() {
-        // 记录请求失败
-        app_state
-            .lock()
-            .unwrap()
-            .record_task_request_time(request_start_time.elapsed().as_millis() as f64, false);
-        return Err(anyhow!("交易确认失败"));
-    }
+                if receipt.is_none() {
+                    return Err(anyhow!("交易确认失败"));
+                }
 
-    // 获取挖矿任务
-    let (nonce, difficulty, active) = match contract.get_my_task().call().await {
-        Ok(result) => result,
-        Err(e) => {
-            // 记录请求失败
-            app_state
-                .lock()
-                .unwrap()
-                .record_task_request_time(request_start_time.elapsed().as_millis() as f64, false);
-            return Err(anyhow!("获取任务数据失败: {}", e));
-        }
-    };
+                // 获取挖矿任务
+                let (nonce, difficulty, active) = contract_clone.get_my_task().call().await?;
 
-    if !active {
-        // 记录请求失败
-        app_state
-            .lock()
-            .unwrap()
-            .record_task_request_time(request_start_time.elapsed().as_millis() as f64, false);
-        return Err(anyhow!("挖矿任务未激活"));
-    }
+                if !active {
+                    return Err(anyhow!("挖矿任务未激活"));
+                }
 
-    // 记录请求成功及耗时
-    let request_time = request_start_time.elapsed().as_millis() as f64;
-    app_state
-        .lock()
-        .unwrap()
-        .record_task_request_time(request_time, true);
+                Ok((nonce, difficulty, active))
+            }) as futures::future::BoxFuture<'static, Result<(U256, U256, bool)>>
+        };
 
-    // 日志记录请求时间
-    let time_msg = format!("任务 {} - 请求耗时: {:.2}毫秒", task_id, request_time);
-    app_state.lock().unwrap().add_log(time_msg, LogLevel::Info);
-
-    // 更新任务数据
-    app_state
-        .lock()
-        .unwrap()
-        .update_task_data(task_id, nonce, difficulty);
-
-    let task_info_msg = format!(
-        "任务 {} - 获取到挖矿任务: nonce={:?}, difficulty={:?}",
-        task_id, nonce, difficulty
-    );
-    app_state
-        .lock()
-        .unwrap()
-        .add_log(task_info_msg, LogLevel::Info);
-    app_state
-        .lock()
-        .unwrap()
-        .update_task(task_id, "计算中".to_string());
-
-    // 记录计算开始时间
-    let calculation_start_time = Instant::now();
-
-    // 计算解决方案
-    let address = contract.client().address();
-    let solution =
-        match await_solution(nonce, address, difficulty, task_id, app_state.clone()).await {
-            Ok(s) => s,
-            Err(e) => {
-                // 记录计算失败
+        // 使用负载均衡器执行请求
+        match rpc::execute_rpc_request(app_state, request_func).await {
+            Ok((nonce, difficulty, active)) => {
+                // 记录请求成功及耗时
+                let request_time = request_start_time.elapsed().as_millis() as f64;
                 app_state
                     .lock()
                     .unwrap()
-                    .record_calculation_time(calculation_start_time.elapsed().as_secs_f64(), false);
-                return Err(e);
+                    .record_task_request_time(request_time, true);
+
+                // 日志记录请求时间
+                let time_msg = format!("任务 {} - 请求耗时: {:.2}毫秒", task_id, request_time);
+                app_state.lock().unwrap().add_log(time_msg, LogLevel::Info);
+
+                // 更新任务数据
+                app_state
+                    .lock()
+                    .unwrap()
+                    .update_task_data(task_id, nonce, difficulty);
+
+                let task_info_msg = format!(
+                    "任务 {} - 获取到挖矿任务: nonce={:?}, difficulty={:?}",
+                    task_id, nonce, difficulty
+                );
+                app_state
+                    .lock()
+                    .unwrap()
+                    .add_log(task_info_msg, LogLevel::Info);
+                app_state
+                    .lock()
+                    .unwrap()
+                    .update_task(task_id, "计算中".to_string());
+
+                // 记录计算开始时间
+                let calculation_start_time = Instant::now();
+
+                // 计算解决方案
+                let address = contract.client().address();
+                let solution =
+                    await_solution(nonce, address, difficulty, task_id, app_state.clone()).await?;
+
+                // 记录计算成功及耗时
+                let calculation_time = calculation_start_time.elapsed().as_secs_f64();
+                app_state
+                    .lock()
+                    .unwrap()
+                    .record_calculation_time(calculation_time, true);
+
+                let solution_msg = format!(
+                    "任务 {} - 找到解决方案: {:?}, 计算耗时: {:.2}秒",
+                    task_id, solution, calculation_time
+                );
+                app_state
+                    .lock()
+                    .unwrap()
+                    .add_log(solution_msg, LogLevel::Success);
+
+                // 本地再次验证解决方案，确保满足难度要求
+                let verification_msg = format!("任务 {} - 验证解决方案是否满足难度要求", task_id);
+                app_state
+                    .lock()
+                    .unwrap()
+                    .add_log(verification_msg, LogLevel::Info);
+
+                if !verify_solution_locally(nonce, address, solution, difficulty)? {
+                    let error_msg = format!(
+                        "任务 {} - 本地验证失败，解决方案不满足难度要求，放弃提交",
+                        task_id
+                    );
+                    app_state
+                        .lock()
+                        .unwrap()
+                        .add_log(error_msg, LogLevel::Error);
+
+                    return Err(anyhow!("解决方案本地验证失败"));
+                }
+
+                // 验证任务是否仍然有效（防止其他矿工已经提交）
+                let (current_nonce, _, current_active) = contract.get_my_task().call().await?;
+
+                if current_nonce != nonce || !current_active {
+                    let warning_msg =
+                        format!("任务 {} - 任务已被其他矿工完成或已失效，放弃提交", task_id);
+                    app_state
+                        .lock()
+                        .unwrap()
+                        .add_log(warning_msg, LogLevel::Warning);
+
+                    return Err(anyhow!("任务已失效"));
+                }
+
+                Ok(solution)
+            }
+            Err(e) => {
+                // 记录请求失败
+                app_state.lock().unwrap().record_task_request_time(
+                    request_start_time.elapsed().as_millis() as f64,
+                    false,
+                );
+
+                Err(anyhow!("负载均衡请求挖矿任务失败: {}", e))
+            }
+        }
+    } else {
+        // 使用传统方式请求
+        // 请求挖矿任务
+        let tx_request = contract.request_mining_task();
+        let pending_tx = match tx_request.send().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                // 记录请求失败
+                app_state.lock().unwrap().record_task_request_time(
+                    request_start_time.elapsed().as_millis() as f64,
+                    false,
+                );
+                return Err(anyhow!("请求挖矿任务失败: {}", e));
             }
         };
 
-    // 记录计算成功及耗时
-    let calculation_time = calculation_start_time.elapsed().as_secs_f64();
-    app_state
-        .lock()
-        .unwrap()
-        .record_calculation_time(calculation_time, true);
+        let receipt = match pending_tx.await {
+            Ok(r) => r,
+            Err(e) => {
+                // 记录请求失败
+                app_state.lock().unwrap().record_task_request_time(
+                    request_start_time.elapsed().as_millis() as f64,
+                    false,
+                );
+                return Err(anyhow!("交易确认失败: {}", e));
+            }
+        };
 
-    let solution_msg = format!(
-        "任务 {} - 找到解决方案: {:?}, 计算耗时: {:.2}秒",
-        task_id, solution, calculation_time
-    );
-    app_state
-        .lock()
-        .unwrap()
-        .add_log(solution_msg, LogLevel::Success);
+        if receipt.is_none() {
+            // 记录请求失败
+            app_state
+                .lock()
+                .unwrap()
+                .record_task_request_time(request_start_time.elapsed().as_millis() as f64, false);
+            return Err(anyhow!("交易确认失败"));
+        }
 
-    // 本地再次验证解决方案，确保满足难度要求
-    let verification_msg = format!("任务 {} - 验证解决方案是否满足难度要求", task_id);
-    app_state
-        .lock()
-        .unwrap()
-        .add_log(verification_msg, LogLevel::Info);
+        // 获取挖矿任务
+        let (nonce, difficulty, active) = match contract.get_my_task().call().await {
+            Ok(result) => result,
+            Err(e) => {
+                // 记录请求失败
+                app_state.lock().unwrap().record_task_request_time(
+                    request_start_time.elapsed().as_millis() as f64,
+                    false,
+                );
+                return Err(anyhow!("获取任务数据失败: {}", e));
+            }
+        };
 
-    if !verify_solution_locally(nonce, address, solution, difficulty)? {
-        let error_msg = format!(
-            "任务 {} - 本地验证失败，解决方案不满足难度要求，放弃提交",
-            task_id
+        if !active {
+            // 记录请求失败
+            app_state
+                .lock()
+                .unwrap()
+                .record_task_request_time(request_start_time.elapsed().as_millis() as f64, false);
+            return Err(anyhow!("挖矿任务未激活"));
+        }
+
+        // 记录请求成功及耗时
+        let request_time = request_start_time.elapsed().as_millis() as f64;
+        app_state
+            .lock()
+            .unwrap()
+            .record_task_request_time(request_time, true);
+
+        // 日志记录请求时间
+        let time_msg = format!("任务 {} - 请求耗时: {:.2}毫秒", task_id, request_time);
+        app_state.lock().unwrap().add_log(time_msg, LogLevel::Info);
+
+        // 更新任务数据
+        app_state
+            .lock()
+            .unwrap()
+            .update_task_data(task_id, nonce, difficulty);
+
+        let task_info_msg = format!(
+            "任务 {} - 获取到挖矿任务: nonce={:?}, difficulty={:?}",
+            task_id, nonce, difficulty
         );
         app_state
             .lock()
             .unwrap()
-            .add_log(error_msg, LogLevel::Error);
-
-        return Err(anyhow!("解决方案本地验证失败"));
-    }
-
-    // 验证任务是否仍然有效（防止其他矿工已经提交）
-    let (current_nonce, _, current_active) = contract.get_my_task().call().await?;
-    if !current_active || current_nonce != nonce {
-        let error_msg = format!("任务 {} - 任务已过期或已被他人提交，放弃提交", task_id);
+            .add_log(task_info_msg, LogLevel::Info);
         app_state
             .lock()
             .unwrap()
-            .add_log(error_msg, LogLevel::Warning);
+            .update_task(task_id, "计算中".to_string());
 
-        return Err(anyhow!("任务已失效"));
+        // 记录计算开始时间
+        let calculation_start_time = Instant::now();
+
+        // 计算解决方案
+        let address = contract.client().address();
+        let solution =
+            match await_solution(nonce, address, difficulty, task_id, app_state.clone()).await {
+                Ok(s) => s,
+                Err(e) => {
+                    // 记录计算失败
+                    app_state.lock().unwrap().record_calculation_time(
+                        calculation_start_time.elapsed().as_secs_f64(),
+                        false,
+                    );
+                    return Err(e);
+                }
+            };
+
+        // 记录计算成功及耗时
+        let calculation_time = calculation_start_time.elapsed().as_secs_f64();
+        app_state
+            .lock()
+            .unwrap()
+            .record_calculation_time(calculation_time, true);
+
+        let solution_msg = format!(
+            "任务 {} - 找到解决方案: {:?}, 计算耗时: {:.2}秒",
+            task_id, solution, calculation_time
+        );
+        app_state
+            .lock()
+            .unwrap()
+            .add_log(solution_msg, LogLevel::Success);
+
+        // 本地再次验证解决方案，确保满足难度要求
+        let verification_msg = format!("任务 {} - 验证解决方案是否满足难度要求", task_id);
+        app_state
+            .lock()
+            .unwrap()
+            .add_log(verification_msg, LogLevel::Info);
+
+        if !verify_solution_locally(nonce, address, solution, difficulty)? {
+            let error_msg = format!(
+                "任务 {} - 本地验证失败，解决方案不满足难度要求，放弃提交",
+                task_id
+            );
+            app_state
+                .lock()
+                .unwrap()
+                .add_log(error_msg, LogLevel::Error);
+
+            return Err(anyhow!("解决方案本地验证失败"));
+        }
+
+        // 验证任务是否仍然有效（防止其他矿工已经提交）
+        let (current_nonce, _, current_active) = contract.get_my_task().call().await?;
+
+        if current_nonce != nonce || !current_active {
+            let warning_msg = format!("任务 {} - 任务已被其他矿工完成或已失效，放弃提交", task_id);
+            app_state
+                .lock()
+                .unwrap()
+                .add_log(warning_msg, LogLevel::Warning);
+
+            return Err(anyhow!("任务已失效"));
+        }
+
+        Ok(solution)
     }
-
-    // 返回解决方案供后续提交
-    Ok(solution)
 }
 
 // 本地验证解决方案
@@ -1832,259 +1967,312 @@ async fn submit_with_recovery<M: Middleware + 'static>(
         .unwrap()
         .add_log(base_gas_info, LogLevel::Info);
 
-    // 获取当前nonce
-    let address = contract.client().address();
-    let mut current_nonce = contract
-        .client()
-        .get_transaction_count(address, None)
-        .await?;
+    // 使用负载均衡器执行提交
+    let use_load_balancer = app_state.lock().unwrap().active_load_balancer;
 
-    // 尝试提交，如果失败则重试
-    while retry_count < MAX_RETRIES {
-        // 每次循环都创建新的交易实例
-        let mut tx = contract.submit_mining_result(solution);
+    if use_load_balancer {
+        // 创建提交函数
+        let submit_func = |_rpc_url: &str| {
+            let contract_clone = contract.clone();
+            let solution_clone = solution;
+            let gas_price_buffer = gas_price_with_buffer;
 
-        // 设置当前的gas价格和nonce
-        tx.tx.set_gas_price(gas_price_with_buffer);
-        tx.tx.set_nonce(current_nonce);
+            Box::pin(async move {
+                // 获取当前nonce
+                let address = contract_clone.client().address();
+                let current_nonce = contract_clone
+                    .client()
+                    .get_transaction_count(address, None)
+                    .await?;
 
-        let result = tx.send().await;
+                // 创建交易
+                let mut tx = contract_clone.submit_mining_result(solution_clone);
 
-        match result {
-            Ok(pending_tx) => {
-                // 交易发送成功，等待确认
-                let tx_hash = format!("{:?}", pending_tx.tx_hash());
-                let log_msg = format!(
-                    "任务 {} 解决方案已提交，交易哈希: {} ，等待确认",
-                    task_id, tx_hash
-                );
-                app_state.lock().unwrap().add_log(log_msg, LogLevel::Info);
+                // 设置gas价格和nonce
+                tx.tx.set_gas_price(gas_price_buffer);
+                tx.tx.set_nonce(current_nonce);
+
+                // 发送交易
+                let pending_tx = tx.send().await?;
 
                 // 等待交易确认
-                match pending_tx.await {
-                    Ok(receipt_option) => {
-                        let total_time = submit_start_time.elapsed().as_secs_f64();
+                let receipt = pending_tx.await?;
 
-                        if let Some(receipt) = receipt_option.as_ref() {
-                            // 计算实际gas使用和成本
-                            if let Some(gas_used) = receipt.gas_used {
-                                let actual_gas_cost = gas_used * gas_price_with_buffer;
-                                let gas_cost_eth = ethers::utils::format_ether(actual_gas_cost);
-                                let reward_eth = "3.0"; // 固定3 MAG奖励
-                                let profit = 3.0 - gas_cost_eth.parse::<f64>().unwrap_or(0.0);
-                                let profit_percent = profit / 3.0 * 100.0;
+                Ok(receipt)
+            })
+                as futures::future::BoxFuture<'static, Result<Option<TransactionReceipt>>>
+        };
 
-                                let success_msg = format!(
-                                    "任务 {} 挖矿成功！使用Gas: {}, 成本: {} MAG, 利润: {:.4} MAG ({:.1}%), 提交耗时: {:.2}秒",
-                                    task_id, gas_used, gas_cost_eth, profit, profit_percent, total_time
-                                );
-                                app_state
-                                    .lock()
-                                    .unwrap()
-                                    .add_log(success_msg, LogLevel::Success);
+        // 使用负载均衡器执行请求
+        match rpc::execute_rpc_request(app_state, submit_func).await {
+            Ok(receipt_option) => {
+                let total_time = submit_start_time.elapsed().as_secs_f64();
+
+                // 记录提交成功
+                app_state
+                    .lock()
+                    .unwrap()
+                    .record_submission_time(total_time, true);
+
+                if let Some(receipt) = receipt_option.as_ref() {
+                    // 计算实际gas使用和成本
+                    if let Some(gas_used) = receipt.gas_used {
+                        let actual_gas_cost = gas_used * gas_price_with_buffer;
+                        let gas_cost_eth = ethers::utils::format_ether(actual_gas_cost);
+                        let reward_eth = "3.0"; // 固定3 MAG奖励
+                        let profit = 3.0 - gas_cost_eth.parse::<f64>().unwrap_or(0.0);
+                        let profit_percent = profit / 3.0 * 100.0;
+
+                        let success_msg = format!(
+                            "任务 {} 挖矿成功！使用Gas: {}, 成本: {} MAG, 利润: {:.4} MAG ({:.1}%), 提交耗时: {:.2}秒",
+                            task_id, gas_used, gas_cost_eth, profit, profit_percent, total_time
+                        );
+                        app_state
+                            .lock()
+                            .unwrap()
+                            .add_log(success_msg, LogLevel::Success);
+
+                        // 更新任务状态
+                        app_state
+                            .lock()
+                            .unwrap()
+                            .update_task(task_id, "成功".to_string());
+                    } else {
+                        let success_msg =
+                            format!("任务 {} 挖矿成功！提交耗时: {:.2}秒", task_id, total_time);
+                        app_state
+                            .lock()
+                            .unwrap()
+                            .add_log(success_msg, LogLevel::Success);
+
+                        // 更新任务状态
+                        app_state
+                            .lock()
+                            .unwrap()
+                            .update_task(task_id, "成功".to_string());
+                    }
+                } else {
+                    let warning_msg = format!(
+                        "任务 {} 提交成功但未收到收据，可能处理中，耗时: {:.2}秒",
+                        task_id, total_time
+                    );
+                    app_state
+                        .lock()
+                        .unwrap()
+                        .add_log(warning_msg, LogLevel::Warning);
+
+                    // 更新任务状态
+                    app_state
+                        .lock()
+                        .unwrap()
+                        .update_task(task_id, "提交中".to_string());
+                }
+
+                Ok(receipt_option)
+            }
+            Err(e) => {
+                // 记录提交失败
+                app_state
+                    .lock()
+                    .unwrap()
+                    .record_submission_time(submit_start_time.elapsed().as_secs_f64(), false);
+
+                let error_msg = format!("负载均衡提交失败: {}", e);
+                app_state
+                    .lock()
+                    .unwrap()
+                    .add_log(error_msg, LogLevel::Error);
+
+                // 更新任务状态
+                app_state
+                    .lock()
+                    .unwrap()
+                    .update_task(task_id, "提交失败".to_string());
+
+                Err(anyhow!("负载均衡提交失败: {}", e))
+            }
+        }
+    } else {
+        // 使用传统方式提交
+        // 获取当前nonce
+        let address = contract.client().address();
+        let mut current_nonce = contract
+            .client()
+            .get_transaction_count(address, None)
+            .await?;
+
+        // 尝试提交，如果失败则重试
+        while retry_count < MAX_RETRIES {
+            // 每次循环都创建新的交易实例
+            let mut tx = contract.submit_mining_result(solution);
+
+            // 设置当前的gas价格和nonce
+            tx.tx.set_gas_price(gas_price_with_buffer);
+            tx.tx.set_nonce(current_nonce);
+
+            let result = tx.send().await;
+
+            match result {
+                Ok(pending_tx) => {
+                    // 交易发送成功，等待确认
+                    let tx_hash = format!("{:?}", pending_tx.tx_hash());
+                    let log_msg = format!(
+                        "任务 {} 解决方案已提交，交易哈希: {} ，等待确认",
+                        task_id, tx_hash
+                    );
+                    app_state.lock().unwrap().add_log(log_msg, LogLevel::Info);
+
+                    // 等待交易确认
+                    match pending_tx.await {
+                        Ok(receipt_option) => {
+                            let total_time = submit_start_time.elapsed().as_secs_f64();
+
+                            // 记录提交成功
+                            app_state
+                                .lock()
+                                .unwrap()
+                                .record_submission_time(total_time, true);
+
+                            if let Some(receipt) = receipt_option.as_ref() {
+                                // 计算实际gas使用和成本
+                                if let Some(gas_used) = receipt.gas_used {
+                                    let actual_gas_cost = gas_used * gas_price_with_buffer;
+                                    let gas_cost_eth = ethers::utils::format_ether(actual_gas_cost);
+                                    let reward_eth = "3.0"; // 固定3 MAG奖励
+                                    let profit = 3.0 - gas_cost_eth.parse::<f64>().unwrap_or(0.0);
+                                    let profit_percent = profit / 3.0 * 100.0;
+
+                                    let success_msg = format!(
+                                        "任务 {} 挖矿成功！使用Gas: {}, 成本: {} MAG, 利润: {:.4} MAG ({:.1}%), 提交耗时: {:.2}秒",
+                                        task_id, gas_used, gas_cost_eth, profit, profit_percent, total_time
+                                    );
+                                    app_state
+                                        .lock()
+                                        .unwrap()
+                                        .add_log(success_msg, LogLevel::Success);
+
+                                    // 更新任务状态
+                                    app_state
+                                        .lock()
+                                        .unwrap()
+                                        .update_task(task_id, "成功".to_string());
+                                } else {
+                                    let success_msg = format!(
+                                        "任务 {} 挖矿成功！提交耗时: {:.2}秒",
+                                        task_id, total_time
+                                    );
+                                    app_state
+                                        .lock()
+                                        .unwrap()
+                                        .add_log(success_msg, LogLevel::Success);
+
+                                    // 更新任务状态
+                                    app_state
+                                        .lock()
+                                        .unwrap()
+                                        .update_task(task_id, "成功".to_string());
+                                }
                             } else {
-                                let success_basic = format!(
-                                    "任务 {} 挖矿成功！交易已确认，提交耗时: {:.2}秒",
+                                let warning_msg = format!(
+                                    "任务 {} 提交成功但未收到收据，可能处理中，耗时: {:.2}秒",
                                     task_id, total_time
                                 );
                                 app_state
                                     .lock()
                                     .unwrap()
-                                    .add_log(success_basic, LogLevel::Success);
+                                    .add_log(warning_msg, LogLevel::Warning);
+
+                                // 更新任务状态
+                                app_state
+                                    .lock()
+                                    .unwrap()
+                                    .update_task(task_id, "提交中".to_string());
                             }
+
+                            return Ok(receipt_option);
                         }
-
-                        // 记录提交成功及耗时
-                        app_state
-                            .lock()
-                            .unwrap()
-                            .record_submission_time(total_time, true);
-                        return Ok(receipt_option);
-                    }
-                    Err(e) => {
-                        let error_msg = format!("任务 {} 交易确认失败: {}", task_id, e);
-                        app_state
-                            .lock()
-                            .unwrap()
-                            .add_log(error_msg, LogLevel::Error);
-
-                        // 记录提交失败
-                        app_state.lock().unwrap().record_submission_time(
-                            submit_start_time.elapsed().as_secs_f64(),
-                            false,
-                        );
-                        return Err(anyhow!("交易确认失败"));
-                    }
-                }
-            }
-            Err(e) => {
-                let error_text = e.to_string();
-                if error_text.contains("nonce too low") || error_text.contains("already known") {
-                    // nonce问题，获取正确的nonce
-                    match contract.client().get_transaction_count(address, None).await {
-                        Ok(new_nonce) => {
-                            let nonce_msg = format!(
-                                "任务 {} nonce过低，更新nonce: {:?} -> {:?}",
-                                task_id, current_nonce, new_nonce
-                            );
-                            app_state
-                                .lock()
-                                .unwrap()
-                                .add_log(nonce_msg, LogLevel::Warning);
-
-                            // 更新nonce供下次循环使用
-                            current_nonce = new_nonce;
-                        }
-                        Err(nonce_err) => {
-                            let error_msg =
-                                format!("任务 {} 无法获取新nonce: {}", task_id, nonce_err);
+                        Err(e) => {
+                            // 交易确认失败，尝试重试
+                            let error_msg = format!("任务 {} 交易确认失败: {}", task_id, e);
                             app_state
                                 .lock()
                                 .unwrap()
                                 .add_log(error_msg, LogLevel::Error);
 
-                            // 记录提交失败
-                            app_state.lock().unwrap().record_submission_time(
-                                submit_start_time.elapsed().as_secs_f64(),
-                                false,
-                            );
-                            return Err(anyhow!(nonce_err));
-                        }
-                    }
-                } else if error_text.contains("underpriced") {
-                    // gas价格过低，智能调整gas价格
+                            // 增加重试计数
+                            retry_count += 1;
 
-                    // 计算当前挖矿收益估算 (3 MAG每次挖矿)
-                    let mining_reward = ethers::utils::parse_ether(3.0)?;
+                            if retry_count < MAX_RETRIES {
+                                // 增加gas价格并重试
+                                gas_price_with_buffer = gas_price_with_buffer * 110 / 100; // 每次增加10%
+                                current_nonce += U256::from(1); // 增加nonce
 
-                    // 估算交易所需gas量 (通常POW提交大约需要10-15万gas)
-                    let estimated_gas = U256::from(150_000);
-
-                    // 检查当前区块链状态，可能网络拥堵有变化
-                    let network_load_updated =
-                        match contract.client().get_block(BlockNumber::Latest).await {
-                            Ok(Some(block)) => {
-                                // gas_used和gas_limit已经是U256类型而不是Option<U256>
-                                let gas_used = block.gas_used;
-                                let gas_limit = block.gas_limit;
-                                if !gas_limit.is_zero() {
-                                    Some(gas_used.as_u128() as f64 / gas_limit.as_u128() as f64)
-                                } else {
-                                    None
-                                }
+                                let retry_msg = format!(
+                                    "任务 {} 重试提交 ({}/{}), 增加Gas价格至: {} Gwei",
+                                    task_id,
+                                    retry_count,
+                                    MAX_RETRIES,
+                                    gas_price_with_buffer.as_u64() / 1_000_000_000
+                                );
+                                app_state
+                                    .lock()
+                                    .unwrap()
+                                    .add_log(retry_msg, LogLevel::Warning);
                             }
-                            _ => None,
-                        };
-
-                    // 如果网络负载更新成功，调整网络负载系数
-                    if let Some(new_load) = network_load_updated {
-                        if (new_load - network_load).abs() > 0.1 {
-                            // 网络负载变化超过10%
-                            network_load = new_load;
-                            let update_msg = format!(
-                                "任务 {} - 网络负载已更新: {:.1}%",
-                                task_id,
-                                network_load * 100.0
-                            );
-                            app_state
-                                .lock()
-                                .unwrap()
-                                .add_log(update_msg, LogLevel::Info);
                         }
                     }
-
-                    // 最小增长率（基础增长率，确保gas价格有足够增长以满足underpriced要求）
-                    // 当前设置为15%，较低的基础涨价可减少矿工成本
-                    let min_increase = 1150;
-
-                    // 根据网络负载和重试次数动态调整增幅
-                    let network_factor = match network_load {
-                        load if load > 0.8 => 10, // 高负载 +10% 额外增幅
-                        load if load > 0.6 => 5,  // 中高负载 +5% 额外增幅
-                        _ => 0,                   // 正常负载不额外增加
-                    };
-
-                    // 根据重试次数计算基础增幅
-                    let retry_factor = match retry_count {
-                        0 => 0,  // 第一次重试不额外增加基础增幅
-                        1 => 10, // 第二次重试 +10% 额外增幅
-                        _ => 25, // 最后重试 +25% 额外增幅
-                    };
-
-                    // 计算总增长率（基础1000 + 网络因子 + 重试因子）/ 10
-                    let increase_percent =
-                        (min_increase + network_factor * 10 + retry_factor * 10) / 10;
-
-                    // 计算最大可接受的gas价格（确保至少有40%的收益）
-                    let min_profit_ratio = 40; // 40%最低收益率，保证更好的收益
-                    let max_acceptable_gas_price: U256 =
-                        mining_reward * (100 - min_profit_ratio) / (estimated_gas * 100);
-
-                    let new_gas_price = gas_price_with_buffer * increase_percent / 100;
-
-                    // 确保不超过最大可接受价格
-                    let new_gas_price = std::cmp::min(new_gas_price, max_acceptable_gas_price);
-
-                    // 计算涨幅百分比
-                    let increase_ratio = (new_gas_price.as_u128() as f64
-                        / gas_price_with_buffer.as_u128() as f64)
-                        - 1.0;
-                    let increase_percent_display = (increase_ratio * 100.0) as u64;
-
-                    let gas_msg = format!(
-                        "任务 {} - Gas价格过低调整: {} Gwei → {} Gwei (上涨{}%), 预计收益率: {}%",
-                        task_id,
-                        gas_price_with_buffer.as_u64() / 1_000_000_000,
-                        new_gas_price.as_u64() / 1_000_000_000,
-                        increase_percent_display,
-                        100 - (new_gas_price.as_u128() * estimated_gas.as_u128() * 100
-                            / mining_reward.as_u128()) as u64
-                    );
-
-                    app_state
-                        .lock()
-                        .unwrap()
-                        .add_log(gas_msg, LogLevel::Warning);
-
-                    // 更新gas价格供下次循环使用
-                    gas_price_with_buffer = new_gas_price;
-                } else {
-                    // 其他错误，不重试
-                    let error_msg = format!("任务 {} 提交失败: {}", task_id, e);
+                }
+                Err(e) => {
+                    // 交易发送失败，尝试重试
+                    let error_msg = format!("任务 {} 交易发送失败: {}", task_id, e);
                     app_state
                         .lock()
                         .unwrap()
                         .add_log(error_msg, LogLevel::Error);
 
-                    // 记录提交失败
-                    app_state
-                        .lock()
-                        .unwrap()
-                        .record_submission_time(submit_start_time.elapsed().as_secs_f64(), false);
-                    return Err(anyhow!(e));
+                    // 增加重试计数
+                    retry_count += 1;
+
+                    if retry_count < MAX_RETRIES {
+                        // 增加gas价格并重试
+                        gas_price_with_buffer = gas_price_with_buffer * 110 / 100; // 每次增加10%
+                        current_nonce += U256::from(1); // 增加nonce
+
+                        let retry_msg = format!(
+                            "任务 {} 重试提交 ({}/{}), 增加Gas价格至: {} Gwei",
+                            task_id,
+                            retry_count,
+                            MAX_RETRIES,
+                            gas_price_with_buffer.as_u64() / 1_000_000_000
+                        );
+                        app_state
+                            .lock()
+                            .unwrap()
+                            .add_log(retry_msg, LogLevel::Warning);
+                    }
                 }
             }
         }
 
-        retry_count += 1;
-        let retry_msg = format!(
-            "任务 {} 重试提交 ({}/{})",
-            task_id, retry_count, MAX_RETRIES
-        );
+        // 所有重试都失败
+        let final_error_msg = format!("任务 {} 提交失败，已重试{}次", task_id, MAX_RETRIES);
         app_state
             .lock()
             .unwrap()
-            .add_log(retry_msg, LogLevel::Warning);
+            .add_log(final_error_msg, LogLevel::Error);
 
-        // 等待一会儿再重试
-        sleep(Duration::from_millis(500)).await;
+        // 记录提交失败
+        app_state
+            .lock()
+            .unwrap()
+            .record_submission_time(submit_start_time.elapsed().as_secs_f64(), false);
+
+        // 更新任务状态
+        app_state
+            .lock()
+            .unwrap()
+            .update_task(task_id, "提交失败".to_string());
+
+        Err(anyhow!("提交失败，已达到最大重试次数"))
     }
-
-    // 记录提交失败（达到最大重试次数）
-    app_state
-        .lock()
-        .unwrap()
-        .record_submission_time(submit_start_time.elapsed().as_secs_f64(), false);
-
-    Err(anyhow!("达到最大重试次数，提交失败"))
 }

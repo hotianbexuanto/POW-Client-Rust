@@ -138,6 +138,19 @@ pub struct App {
     pub rpc_response_times: HashMap<String, u64>,
     // 日志滚动位置
     pub log_scroll: usize,
+    // 添加RPC节点状态跟踪
+    pub rpc_node_statuses: Vec<RpcNodeStatus>,
+    pub active_load_balancer: bool,
+}
+
+// 添加RPC节点状态结构体
+#[derive(Clone, Debug)]
+pub struct RpcNodeStatus {
+    pub url: String,
+    pub response_time: Option<u64>,
+    pub health_score: f64,
+    pub active: bool,
+    pub success_rate: f64,
 }
 
 impl App {
@@ -166,6 +179,8 @@ impl App {
             custom_rpc: None,
             rpc_response_times: HashMap::new(),
             log_scroll: 0,
+            rpc_node_statuses: Vec::new(),
+            active_load_balancer: true, // 默认启用负载均衡
         }
     }
 
@@ -419,5 +434,54 @@ impl App {
 
         // 更新任务列表
         self.tasks = active_tasks;
+    }
+
+    // 更新RPC节点状态
+    pub fn update_rpc_node_status(
+        &mut self,
+        url: String,
+        response_time: Option<u64>,
+        health_score: f64,
+        active: bool,
+        success_rate: f64,
+    ) {
+        // 查找是否已有此节点
+        if let Some(node) = self
+            .rpc_node_statuses
+            .iter_mut()
+            .find(|node| node.url == url)
+        {
+            // 更新现有节点
+            if let Some(time) = response_time {
+                node.response_time = Some(time);
+            }
+            node.health_score = health_score;
+            node.active = active;
+            node.success_rate = success_rate;
+        } else {
+            // 添加新节点
+            self.rpc_node_statuses.push(RpcNodeStatus {
+                url,
+                response_time,
+                health_score,
+                active,
+                success_rate,
+            });
+        }
+    }
+
+    // 清除所有RPC节点状态
+    pub fn clear_rpc_node_statuses(&mut self) {
+        self.rpc_node_statuses.clear();
+    }
+
+    // 设置负载均衡器状态
+    pub fn set_load_balancer_active(&mut self, active: bool) {
+        self.active_load_balancer = active;
+
+        // 添加日志
+        let status = if active { "启用" } else { "禁用" };
+        let log_msg = format!("RPC节点负载均衡已{}", status);
+        self.add_log(log_msg, LogLevel::Info);
     }
 }

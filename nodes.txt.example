@@ -1,1 +1,21 @@
- 
+# Magnet POW 区块链挖矿客户端自定义RPC节点
+# Magnet POW Blockchain Mining Client Custom RPC Nodes
+#
+# 使用说明 / Instructions:
+# 1. 将此文件重命名为 nodes.txt / Rename this file to nodes.txt
+# 2. 每行添加一个RPC节点URL / Add one RPC node URL per line
+# 3. 确保URL以http://或https://开头 / Ensure URLs start with http:// or https://
+# 4. 空行和#开头的行将被忽略 / Empty lines and lines starting with # will be ignored
+#
+# 示例 / Examples:
+https://node1.magnetchain.xyz
+https://node2.magnetchain.xyz
+https://node3.magnetchain.xyz
+https://node4.magnetchain.xyz
+
+# 可以添加其他自定义节点，例如:
+# https://rpc.example.com
+# https://custom-node.example.org
+
+# 注释行将被忽略
+# 空行也将被忽略 
