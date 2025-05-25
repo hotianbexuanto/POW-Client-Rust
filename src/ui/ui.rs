@@ -202,72 +202,84 @@ fn render_config_info(f: &mut Frame, app: &App, area: Rect) {
 
 // 渲染挖矿摘要信息
 fn render_mining_summary(f: &mut Frame, app: &App, area: Rect) {
-    // 格式化运行时间
-    let uptime_str = format_duration(Duration::from_secs(app.mining_status.uptime));
-
-    // 计算后台提交任务数量
-    let submitting_count = app
-        .tasks
-        .iter()
-        .filter(|t| t.status.contains("后台提交") || t.status == "提交中")
-        .count();
-
-    // 计算活跃任务数
-    let active_tasks = app.mining_status.active_tasks;
-
-    // 计算计算中的任务数量
-    let calculating_count = app.tasks.iter().filter(|t| t.status == "计算中").count();
-
-    // 挖矿摘要信息
-    let mining_summary = vec![
+    // 创建挖矿摘要信息
+    let mut summary_info = vec![
         Line::from(vec![
-            Span::styled("挖矿状态: ", Style::default().fg(Color::Yellow)),
-            Span::styled("活跃", Style::default().fg(Color::Green)),
+            Span::styled("活跃任务: ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{}", app.mining_status.active_tasks)),
         ]),
         Line::from(vec![
-            Span::styled("工作模式: ", Style::default().fg(Color::Yellow)),
-            Span::styled(
-                format!("{}任务并行", active_tasks),
-                Style::default().fg(Color::Cyan),
-            ),
+            Span::styled("总任务数: ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{}", app.mining_status.total_tasks)),
         ]),
         Line::from(vec![
-            Span::styled("每任务线程: ", Style::default().fg(Color::Yellow)),
-            Span::raw(format!("{}", app.config.thread_count)),
-        ]),
-        Line::from(vec![
-            Span::styled("总哈希率: ", Style::default().fg(Color::Yellow)),
-            Span::raw(format!("{:.2} H/s", app.mining_status.total_hash_rate)),
-        ]),
-        Line::from(vec![
-            Span::styled("找到解决方案: ", Style::default().fg(Color::Yellow)),
+            Span::styled("已找到解决方案: ", Style::default().fg(Color::Green)),
             Span::raw(format!("{}", app.mining_status.total_solutions_found)),
         ]),
         Line::from(vec![
-            Span::styled("当前计算中: ", Style::default().fg(Color::Yellow)),
-            Span::raw(format!("{}", calculating_count)),
-        ]),
-        Line::from(vec![
-            Span::styled("后台提交中: ", Style::default().fg(Color::Blue)),
-            Span::raw(format!("{}", submitting_count)),
-        ]),
-        Line::from(vec![
-            Span::styled("挖矿收益: ", Style::default().fg(Color::Green)),
-            Span::raw(format!("{:.4} MAG", app.mining_status.total_mined)),
-            Span::styled(" (实际到账)", Style::default().fg(Color::DarkGray)),
+            Span::styled("总哈希率: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{:.2} H/s", app.mining_status.total_hash_rate)),
         ]),
         Line::from(vec![
             Span::styled("运行时间: ", Style::default().fg(Color::Yellow)),
-            Span::raw(uptime_str),
+            Span::raw(format_duration(Duration::from_secs(
+                app.mining_status.uptime,
+            ))),
         ]),
     ];
 
-    // 渲染挖矿摘要
-    let mining_block = Block::default().borders(Borders::ALL).title("挖矿摘要");
-    let mining_paragraph = Paragraph::new(Text::from(mining_summary))
-        .block(mining_block)
+    // 添加当前挖矿会话信息
+    if app.mining_active {
+        if let Some(session) = &app.current_mining_session {
+            // 添加分隔行
+            summary_info.push(Line::from(Span::styled(
+                "当前挖矿会话",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )));
+
+            // 添加会话信息
+            summary_info.push(Line::from(vec![
+                Span::styled("Nonce: ", Style::default().fg(Color::Yellow)),
+                Span::raw(format!("{}", session.nonce)),
+            ]));
+
+            summary_info.push(Line::from(vec![
+                Span::styled("难度: ", Style::default().fg(Color::Yellow)),
+                Span::raw(format!("{}", session.difficulty)),
+            ]));
+
+            summary_info.push(Line::from(vec![
+                Span::styled("哈希率: ", Style::default().fg(Color::Cyan)),
+                Span::raw(format!("{:.2} H/s", app.current_hashrate)),
+            ]));
+
+            summary_info.push(Line::from(vec![
+                Span::styled("已计算哈希: ", Style::default().fg(Color::Cyan)),
+                Span::raw(format!("{}", session.hash_count)),
+            ]));
+
+            summary_info.push(Line::from(vec![
+                Span::styled("运行时间: ", Style::default().fg(Color::Yellow)),
+                Span::raw(format_duration(session.start_time.elapsed())),
+            ]));
+
+            if let Some(solution) = session.solution {
+                summary_info.push(Line::from(vec![
+                    Span::styled("解决方案: ", Style::default().fg(Color::Green)),
+                    Span::raw(format!("{}", solution)),
+                ]));
+            }
+        }
+    }
+
+    // 渲染挖矿摘要信息
+    let summary_block = Block::default().borders(Borders::ALL).title("挖矿摘要");
+    let summary_paragraph = Paragraph::new(Text::from(summary_info))
+        .block(summary_block)
         .wrap(Wrap { trim: true });
-    f.render_widget(mining_paragraph, area);
+    f.render_widget(summary_paragraph, area);
 }
 
 // 渲染任务列表

@@ -52,10 +52,12 @@ use tokio::{sync::mpsc, time::sleep};
 ///
 /// 这些优化确保了验证结果的准确性，大幅降低了错误率。
 mod contract;
+mod mining;
 mod rpc;
 mod ui;
 
 use contract::MiningContract;
+use mining::{calculate_hash, fast_verify_solution, verify_solution, MiningSession};
 use rpc::select_rpc_node;
 use ui::{
     app::{App, AppConfig, LogLevel, TaskInfo},
@@ -1201,67 +1203,11 @@ fn verify_solution_locally(
     solution: U256,
     difficulty: U256,
 ) -> Result<bool> {
-    // 打包数据 - 与挖矿计算中相同的方法
-    let packed_data = solidity_pack_uint_address(nonce, address)?;
-    let mut input_data = Vec::with_capacity(packed_data.len() + 32);
-    input_data.extend_from_slice(&packed_data);
-
-    // 添加solution
-    let mut buffer = [0u8; 32];
-    solution.to_big_endian(&mut buffer);
-    input_data.extend_from_slice(&buffer);
-
-    // 计算哈希
-    let hash = keccak256(&input_data);
-    let hash_u256 = U256::from_big_endian(&hash);
-
-    // 验证哈希是否有基本问题
-    if !is_valid_hash(&hash, &difficulty) {
-        return Ok(false);
-    }
-
-    // 计算难度值
-    let hash_big = BigUint::from_bytes_be(&hash);
-    let difficulty_big = BigUint::from_bytes_be(&to_be_bytes_32(&difficulty));
-    let max_big = BigUint::from_bytes_be(&[0xFF; 32]);
-
-    // 三种验证方法，提高准确性
-
-    // 方法1：检查 hash * difficulty < 2^256
-    // 优点：直接对应合约中的验证方式，精确度高
-    let product = &hash_big * &difficulty_big;
-    let is_valid_method1 = product < max_big;
-
-    // 方法2：检查 hash < 2^256 / difficulty
-    // 优点：避免了大数乘法可能的溢出问题，数值稳定
-    let target = &max_big / &difficulty_big;
-    let is_valid_method2 = hash_big <= target;
-
-    // 方法3：使用比较哈希的最高位来验证
-    // 优点：计算简单高效，可以快速过滤明显不符合要求的哈希
-    let required_zeros = (difficulty.bits() as usize).saturating_sub(1);
-    let actual_zeros = hash_u256.leading_zeros() as usize;
-    let is_valid_method3 = actual_zeros >= required_zeros;
-
-    // 记录验证结果
-    let all_methods_agree =
-        is_valid_method1 == is_valid_method2 && is_valid_method2 == is_valid_method3;
-    if !all_methods_agree {
-        println!(
-            "警告：验证方法结果不一致！方法1={}, 方法2={}, 方法3={}",
-            is_valid_method1, is_valid_method2, is_valid_method3
-        );
-    }
-
-    // 使用三种验证方法的多数投票，至少两种方法同意才有效
-    // 这大大降低了单个验证方法可能出现的错误率
-    let is_valid = (is_valid_method1 && is_valid_method2)
-        || (is_valid_method2 && is_valid_method3)
-        || (is_valid_method1 && is_valid_method3);
-
-    Ok(is_valid)
+    // 使用新的验证函数
+    Ok(verify_solution(nonce, address, solution, difficulty))
 }
 
+// 修改await_solution函数，使用新的挖矿模块
 async fn await_solution(
     nonce: U256,
     address: Address,
@@ -1269,25 +1215,11 @@ async fn await_solution(
     task_id: usize,
     app_state: Arc<Mutex<App>>,
 ) -> Result<U256> {
-    let start_time = Instant::now();
-    let _timeout = Duration::from_secs(MINING_TIMEOUT_SECS);
-
-    let solution = mine_solution(nonce, address, difficulty, task_id, app_state.clone()).await?;
-
-    let elapsed = start_time.elapsed();
-    let mining_time_msg = format!(
-        "任务 {} - 挖矿耗时: {:.2}秒",
-        task_id,
-        elapsed.as_secs_f64()
-    );
-    app_state
-        .lock()
-        .unwrap()
-        .add_log(mining_time_msg.clone(), LogLevel::Info);
-
-    Ok(solution)
+    // 使用挖矿模块计算解决方案
+    mine_solution(nonce, address, difficulty, task_id, app_state).await
 }
 
+// 修改mine_solution函数，使用新的挖矿模块
 async fn mine_solution(
     nonce: U256,
     address: Address,
@@ -1295,306 +1227,89 @@ async fn mine_solution(
     task_id: usize,
     app_state: Arc<Mutex<App>>,
 ) -> Result<U256> {
-    // 使用所有配置的线程
+    // 创建挖矿会话
     let thread_count = app_state.lock().unwrap().config.thread_count;
 
-    // 记录所有可用线程数
-    let all_threads_info = format!("任务 {} 使用 {} 个线程同时挖矿", task_id, thread_count);
-    app_state
-        .lock()
-        .unwrap()
-        .add_log(all_threads_info, LogLevel::Info);
+    // 更新UI状态
+    {
+        let mut app = app_state.lock().unwrap();
+        app.update_mining_session(nonce, address, difficulty);
+        app.add_log(
+            format!("开始挖矿 Nonce: {}, 难度: {}", nonce, difficulty),
+            LogLevel::Info,
+        );
+    }
 
-    // 创建停止标志
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let solution_found = Arc::new(AtomicBool::new(false));
-    let solution_value = Arc::new(AtomicU64::new(0));
-    let hashes_checked = Arc::new(AtomicUsize::new(0));
-    let error_occurred = Arc::new(AtomicBool::new(false));
-    let error_message = Arc::new(Mutex::new(String::new()));
+    // 创建挖矿会话
+    let session = MiningSession::new(nonce, address, difficulty);
+    let session_clone = session.clone();
 
-    // 启动哈希率更新任务
-    let update_task = {
-        let hashes_checked = hashes_checked.clone();
-        let app_state = app_state.clone();
-        let solution_found = solution_found.clone();
-        let stop_flag = stop_flag.clone();
-        let error_occurred = error_occurred.clone();
+    // 创建哈希率更新任务
+    let app_state_clone = Arc::clone(&app_state);
+    let update_task = tokio::task::spawn_blocking(move || {
+        let mut last_count = 0;
+        while !session_clone.should_stop() {
+            // 每秒更新一次哈希率
+            thread::sleep(Duration::from_secs(1));
 
-        tokio::spawn(async move {
-            let mut last_check = Instant::now();
-            let mut last_hashes = 0;
+            let current_count = session_clone.get_hash_count();
+            let elapsed = session_clone.start_time.elapsed().as_secs_f64();
+            let hash_rate = if elapsed > 0.0 {
+                (current_count - last_count) as f64 / elapsed
+            } else {
+                0.0
+            };
 
-            while !solution_found.load(Ordering::Relaxed)
-                && !stop_flag.load(Ordering::Relaxed)
-                && !error_occurred.load(Ordering::Relaxed)
+            // 更新任务哈希率
             {
-                sleep(Duration::from_secs(1)).await;
+                let mut app = app_state_clone.lock().unwrap();
+                app.update_task_hash_rate(task_id, hash_rate);
+                app.update_hashrate(current_count);
+            }
 
-                let current_hashes = hashes_checked.load(Ordering::Relaxed);
-                let elapsed = last_check.elapsed();
-                let hash_rate = (current_hashes - last_hashes) as f64 / elapsed.as_secs_f64();
+            last_count = current_count;
+        }
+    });
 
-                // 更新哈希率
+    // 开始挖矿
+    let solution_result =
+        tokio::task::spawn_blocking(move || session.find_solution(thread_count)).await?;
+
+    // 停止哈希率更新任务
+    update_task.abort();
+
+    // 检查是否找到解决方案
+    match solution_result {
+        Some(solution) => {
+            // 验证解决方案
+            if fast_verify_solution(nonce, address, solution, difficulty) {
+                // 更新UI状态
+                {
+                    let mut app = app_state.lock().unwrap();
+                    app.update_task_solution(task_id, solution);
+                    app.set_mining_solution(solution);
+                    app.add_log(format!("找到解决方案: {}", solution), LogLevel::Success);
+                }
+
+                Ok(solution)
+            } else {
+                let error_msg = format!("解决方案验证失败: {}", solution);
                 app_state
                     .lock()
                     .unwrap()
-                    .update_task_hash_rate(task_id, hash_rate);
-
-                // 更新总哈希率
-                app_state.lock().unwrap().update_mining_status(1, hash_rate);
-
-                last_check = Instant::now();
-                last_hashes = current_hashes;
+                    .add_log(error_msg.clone(), LogLevel::Error);
+                Err(anyhow!(error_msg))
             }
-        })
-    };
-
-    // 准备工作区间 - 将整个空间均匀分配给所有线程
-    let batch_size = u64::MAX / thread_count as u64;
-    let mut handles = Vec::with_capacity(thread_count);
-
-    // 预先计算一些常量值
-    // 将地址和nonce打包 - 只需计算一次
-    let packed_data = solidity_pack_uint_address(nonce, address)?;
-
-    // 预先计算难度相关值
-    let difficulty_bytes = to_be_bytes_32(&difficulty);
-    let max_bytes = [0xFF; 32];
-
-    // 启动多个计算线程
-    for i in 0..thread_count {
-        let start = U256::from(i as u64 * batch_size);
-        let end = if i == thread_count - 1 {
-            U256::from(u64::MAX)
-        } else {
-            U256::from((i + 1) as u64 * batch_size - 1)
-        };
-
-        let packed_data = packed_data.clone();
-        let stop_flag = stop_flag.clone();
-        let solution_found = solution_found.clone();
-        let solution_value = solution_value.clone();
-        let hashes_checked = hashes_checked.clone();
-        let error_occurred = error_occurred.clone();
-        let error_message = error_message.clone();
-
-        // 拷贝预计算的值
-        let difficulty_bytes = difficulty_bytes;
-        let max_bytes = max_bytes;
-        let difficulty = difficulty; // 为了新的验证方法，需要传递U256版本的难度值
-
-        // 启动计算线程
-        let handle = std::thread::spawn(move || {
-            // 使用BigUint进行范围计算
-            let mut current = BigUint::from_bytes_be(&to_be_bytes_32(&start));
-            let end_big = BigUint::from_bytes_be(&to_be_bytes_32(&end));
-
-            // 预先计算难度比较值 - 只计算一次
-            let difficulty_big = BigUint::from_bytes_be(&difficulty_bytes);
-            let max_big = BigUint::from_bytes_be(&max_bytes);
-
-            // 使用引用避免移动所有权
-            match &max_big / &difficulty_big {
-                target_value => {
-                    let mut counter = 0;
-                    const REPORT_INTERVAL: usize = 10000; // 增大报告间隔减少原子操作频率
-
-                    // 预分配缓冲区减少内存分配
-                    let mut input_data = Vec::with_capacity(packed_data.len() + 32);
-                    input_data.extend_from_slice(&packed_data);
-                    input_data.resize(packed_data.len() + 32, 0); // 预留32字节用于solution
-
-                    // 更高效地使用buffer
-                    let data_prefix_len = packed_data.len();
-
-                    while current <= end_big
-                        && !stop_flag.load(Ordering::Relaxed)
-                        && !error_occurred.load(Ordering::Relaxed)
-                    {
-                        // 将当前值转换为bytes
-                        let current_bytes = current.to_bytes_be();
-                        let current_u256 = match U256::from_big_endian(&pad_to_32(&current_bytes)) {
-                            value => value,
-                        };
-
-                        // 直接在预分配缓冲区上操作，避免多次克隆和分配
-                        current_u256.to_big_endian(&mut input_data[data_prefix_len..]);
-
-                        // 计算哈希
-                        let hash = keccak256(&input_data);
-
-                        // 先进行基础检查，确保哈希有效
-                        if !is_valid_hash(&hash, &difficulty) {
-                            // 哈希可能有问题，跳过这次迭代
-                            current += 1u32;
-                            continue;
-                        }
-
-                        // 处理哈希转换，避免可能的错误
-                        let hash_big = match BigUint::from_bytes_be(&hash) {
-                            value => value,
-                        };
-
-                        // 创建U256版本以便做leading_zeros检查
-                        let hash_u256 = U256::from_big_endian(&hash);
-
-                        // 检查是否满足难度要求 - 三种验证方法的至少两种通过
-
-                        // 方法1: hash_big <= target_value (已经预计算好了)
-                        let is_valid1 = hash_big <= target_value;
-
-                        // 方法2: hash * difficulty < max (2^256)
-                        let product = &hash_big * &difficulty_big;
-                        let is_valid2 = product < max_big;
-
-                        // 方法3: 检查前导零
-                        let required_zeros = (difficulty.bits() as usize).saturating_sub(1);
-                        let actual_zeros = hash_u256.leading_zeros() as usize;
-                        let is_valid3 = actual_zeros >= required_zeros;
-
-                        // 使用多数投票法：至少两种方法认为有效
-                        if (is_valid1 && is_valid2)
-                            || (is_valid2 && is_valid3)
-                            || (is_valid1 && is_valid3)
-                        {
-                            // 找到解决方案
-                            match current_u256.as_u64() {
-                                value => {
-                                    solution_value.store(value, Ordering::Relaxed);
-                                    solution_found.store(true, Ordering::Relaxed);
-                                    stop_flag.store(true, Ordering::Relaxed);
-                                    break;
-                                }
-                            }
-                        }
-
-                        // 更新计数器和检查的哈希数
-                        counter += 1;
-                        if counter % REPORT_INTERVAL == 0 {
-                            hashes_checked.fetch_add(REPORT_INTERVAL, Ordering::Relaxed);
-
-                            // 定期检查停止标志，减少原子操作频率
-                            if stop_flag.load(Ordering::Relaxed)
-                                || error_occurred.load(Ordering::Relaxed)
-                            {
-                                break;
-                            }
-                        }
-
-                        // 递增当前值
-                        current += 1u32;
-                    }
-
-                    // 添加剩余的计数
-                    hashes_checked.fetch_add(counter % REPORT_INTERVAL, Ordering::Relaxed);
-                }
-            }
-
-            Ok::<(), anyhow::Error>(())
-        });
-
-        handles.push(handle);
-    }
-
-    // 等待任何一个线程找到解决方案或所有线程完成
-    loop {
-        // 检查是否找到解决方案
-        if solution_found.load(Ordering::Relaxed) {
-            // 停止所有线程
-            stop_flag.store(true, Ordering::Relaxed);
-            break;
         }
-
-        // 检查是否有错误发生
-        if error_occurred.load(Ordering::Relaxed) {
-            // 停止所有线程
-            stop_flag.store(true, Ordering::Relaxed);
-            let error_text = error_message.lock().unwrap().clone();
-            return Err(anyhow!("计算过程发生错误: {}", error_text));
-        }
-
-        // 检查是否所有线程都已完成
-        let all_finished = handles.iter().all(|h| h.is_finished());
-        if all_finished {
-            break;
-        }
-
-        // 等待一会儿再检查
-        sleep(Duration::from_millis(100)).await;
-    }
-
-    // 取消哈希率更新任务
-    update_task.abort();
-
-    // 等待所有线程完成
-    for handle in handles {
-        if let Err(e) = handle.join() {
-            let error_msg = format!("计算线程异常退出: {:?}", e);
+        None => {
+            let error_msg = "未找到解决方案";
             app_state
                 .lock()
                 .unwrap()
-                .add_log(error_msg.clone(), LogLevel::Error);
-
-            error_occurred.store(true, Ordering::Relaxed);
-            *error_message.lock().unwrap() = error_msg;
+                .add_log(error_msg.to_string(), LogLevel::Warning);
+            Err(anyhow!(error_msg))
         }
     }
-
-    // 检查是否找到了解决方案
-    if solution_found.load(Ordering::Relaxed) {
-        let solution = U256::from(solution_value.load(Ordering::Relaxed));
-        return Ok(solution);
-    }
-
-    // 检查是否有错误发生
-    if error_occurred.load(Ordering::Relaxed) {
-        let error_text = error_message.lock().unwrap().clone();
-        return Err(anyhow!("计算过程发生错误: {}", error_text));
-    }
-
-    Err(anyhow!("未能找到解决方案"))
-}
-
-// 将字节数组填充到32字节
-fn pad_to_32(bytes: &[u8]) -> [u8; 32] {
-    let mut result = [0u8; 32];
-    let start = 32 - bytes.len();
-    result[start..].copy_from_slice(bytes);
-    result
-}
-
-// 检查哈希是否可能有问题（新增函数）
-fn is_valid_hash(hash: &[u8], difficulty: &U256) -> bool {
-    // 检查哈希是否全零或有明显问题
-    if hash.iter().all(|&x| x == 0) {
-        return false;
-    }
-
-    // 检查哈希长度
-    if hash.len() != 32 {
-        return false;
-    }
-
-    // 对于特别大的难度值，检查前导零的合理性
-    if difficulty.bits() > 200 {
-        // 检查哈希前导字节是否全为零
-        let leading_zeros = hash.iter().take_while(|&&x| x == 0).count();
-
-        // 如果难度值很高但哈希没有足够的前导零，可能是计算有问题
-        if leading_zeros < (difficulty.bits() as usize / 16) {
-            return false;
-        }
-    }
-
-    true
-}
-
-// 将U256转换为固定长度的字节数组
-fn to_be_bytes_32(value: &U256) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    value.to_big_endian(&mut bytes);
-    bytes
 }
 
 // 计算预期挖矿收益率

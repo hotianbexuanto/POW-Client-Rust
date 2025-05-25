@@ -141,6 +141,14 @@ pub struct App {
     // 添加RPC节点状态跟踪
     pub rpc_node_statuses: Vec<RpcNodeStatus>,
     pub active_load_balancer: bool,
+    // 挖矿会话信息
+    pub current_mining_session: Option<MiningSessionInfo>,
+    // 当前挖矿任务信息
+    pub current_task: Option<(U256, U256)>, // (nonce, difficulty)
+    // 当前哈希率
+    pub current_hashrate: f64,
+    // 当前挖矿状态
+    pub mining_active: bool,
 }
 
 // 添加RPC节点状态结构体
@@ -151,6 +159,17 @@ pub struct RpcNodeStatus {
     pub health_score: f64,
     pub active: bool,
     pub success_rate: f64,
+}
+
+// 添加挖矿会话信息结构体
+#[derive(Clone, Debug)]
+pub struct MiningSessionInfo {
+    pub start_time: Instant,
+    pub hash_count: u64,
+    pub nonce: U256,
+    pub address: Address,
+    pub difficulty: U256,
+    pub solution: Option<U256>,
 }
 
 impl App {
@@ -181,6 +200,10 @@ impl App {
             log_scroll: 0,
             rpc_node_statuses: Vec::new(),
             active_load_balancer: true, // 默认启用负载均衡
+            current_mining_session: None,
+            current_task: None,
+            current_hashrate: 0.0,
+            mining_active: false,
         }
     }
 
@@ -483,5 +506,45 @@ impl App {
         let status = if active { "启用" } else { "禁用" };
         let log_msg = format!("RPC节点负载均衡已{}", status);
         self.add_log(log_msg, LogLevel::Info);
+    }
+
+    // 更新当前挖矿会话信息
+    pub fn update_mining_session(&mut self, nonce: U256, address: Address, difficulty: U256) {
+        self.current_mining_session = Some(MiningSessionInfo {
+            start_time: Instant::now(),
+            hash_count: 0,
+            nonce,
+            address,
+            difficulty,
+            solution: None,
+        });
+        self.current_task = Some((nonce, difficulty));
+        self.mining_active = true;
+    }
+
+    // 更新哈希率
+    pub fn update_hashrate(&mut self, hash_count: u64) {
+        if let Some(session) = &mut self.current_mining_session {
+            session.hash_count = hash_count;
+            let elapsed = session.start_time.elapsed().as_secs_f64();
+            if elapsed > 0.0 {
+                self.current_hashrate = hash_count as f64 / elapsed;
+            }
+        }
+    }
+
+    // 设置挖矿解决方案
+    pub fn set_mining_solution(&mut self, solution: U256) {
+        if let Some(session) = &mut self.current_mining_session {
+            session.solution = Some(solution);
+        }
+    }
+
+    // 重置挖矿会话
+    pub fn reset_mining_session(&mut self) {
+        self.current_mining_session = None;
+        self.current_task = None;
+        self.current_hashrate = 0.0;
+        self.mining_active = false;
     }
 }

@@ -2,7 +2,10 @@ pub mod app;
 pub mod event;
 pub mod ui;
 
-pub use app::{App, AppState, LogLevel};
+pub use app::{
+    App, AppConfig, AppState, LogLevel, MiningSessionInfo, MiningStatus, RpcNodeStatus, TaskInfo,
+    TaskTimingStats,
+};
 pub use event::{Event, EventHandler};
 pub use ui::render;
 
